@@ -1,0 +1,25 @@
+FH2-FSR4 - AMD FSR 4 Native AA para o Forza Horizon 2 no Azimuth
+
+INSTALAÇÃO
+1. Copie os três DLLs desta pasta para a pasta do Azimuth (ao lado do azimuth.exe):
+     dxgi.dll
+     amd_fidelityfx_loader_dx12.dll
+     amd_fidelityfx_upscaler_dx12.dll
+2. No launcher do Azimuth, deixe o anti-aliasing desligado.
+   (Ou edite data\azimuth.ini e coloque antialiasing=off)
+3. Jogue.
+
+TECLAS
+  F11  liga/desliga o FSR
+  F9   overlay de debug dos motion vectors
+  F10  escala do overlay
+
+DESINSTALAR
+  Apague os três DLLs.
+
+Requisitos: Azimuth 0.9.9, Forza Horizon 2 1.0.0.64, GPU AMD RX 9000 (RX 7000 deve funcionar).
+Log: fh2_fsr.log na pasta do Azimuth.
+
+Os DLLs amd_fidelityfx_* são da AMD (FSR SDK 2.3.0), redistribuídos sem modificação,
+nos termos de LICENSE-AMD-FSR.txt. O dxgi.dll está sob a licença MIT (LICENSE.txt).
+Mod não oficial, sem ligação com a AMD, a Microsoft, a Playground Games ou a Almost There Games.

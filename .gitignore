@@ -1,0 +1,6 @@
+build/
+dist/
+third_party/
+*.dll
+*.zip
+*.log
