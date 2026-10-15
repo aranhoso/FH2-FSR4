@@ -1,76 +1,76 @@
 # FH2-FSR4
 
-**AMD FSR 4 Native AA (FSR Upscaling 4.1.1) para o Forza Horizon 2 rodando no [Azimuth](https://almost-there-games.itch.io/azimuth).**
+**AMD FSR 4 Native AA (FSR Upscaling 4.1.1) for Forza Horizon 2 running on [Azimuth](https://almost-there-games.itch.io/azimuth).**
 
-O mod troca o MSAA do jogo pelo anti-aliasing temporal do FSR 4 em resolução nativa (sem upscaling). O resultado são bordas sem serrilhado, mais estabilidade em cercas, fios e vegetação, e uma imagem mais limpa em movimento.
+This mod replaces the game's MSAA with FSR 4's temporal anti-aliasing at native resolution (no upscaling). The result is no jaggies, stable fences, wires and foliage, and a much cleaner image in motion.
 
-É um mod não oficial, sem ligação com a AMD, a Microsoft, a Playground Games ou a Almost There Games.
+It is an unofficial mod, not affiliated with AMD, Microsoft, Playground Games or Almost There Games.
 
-## Requisitos
+## Requirements
 
 | | |
 |---|---|
 | Azimuth | 0.9.9 |
-| Forza Horizon 2 | build 1.0.0.64 (a sua própria cópia, configurada no Azimuth) |
-| GPU | AMD Radeon RX 9000 (RDNA 4). A RX 7000 (RDNA 3) também deve funcionar, porque a AMD liberou o FSR 4.1 para ela no SDK 2.3.0 |
-| Driver | AMD Software: Adrenalin recente |
+| Forza Horizon 2 | build 1.0.0.64 (your own copy, set up in Azimuth) |
+| GPU | AMD Radeon RX 9000 (RDNA 4). RX 7000 (RDNA 3) should also work, since AMD enabled FSR 4.1 for it in SDK 2.3.0 |
+| Driver | A recent AMD Software: Adrenalin |
 
-Testado até agora só numa **RX 9070 XT**, com Windows 11 e 2560x1440 em HDR. Em outras GPUs o loader da AMD escolhe outro provider, e isso ainda não foi testado.
+So far it has only been tested on an **RX 9070 XT**, on Windows 11 at 2560x1440 with HDR. On other GPUs, AMD's loader picks a different provider, which has not been tested yet.
 
-## Instalação
+## Installation
 
-1. Baixe o `.zip` da página de [Releases](../../releases).
-2. Copie os três DLLs para a pasta do **Azimuth**, ao lado do `azimuth.exe`:
-   - `dxgi.dll` (o mod)
+1. Download the `.zip` from the [Releases](../../releases) page.
+2. Copy the three DLLs into your **Azimuth** folder, next to `azimuth.exe`:
+   - `dxgi.dll` (the mod)
    - `amd_fidelityfx_loader_dx12.dll` (AMD)
    - `amd_fidelityfx_upscaler_dx12.dll` (AMD, FSR 4.1.1)
-3. No launcher do Azimuth, deixe o **anti-aliasing desligado**. O FSR passa a ser o anti-aliasing. Também dá para editar `data\azimuth.ini` e colocar `antialiasing=off`.
-4. Jogue normalmente.
+3. In the Azimuth launcher, **turn anti-aliasing off**. FSR becomes the anti-aliasing. You can also edit `data\azimuth.ini` and set `antialiasing=off`.
+4. Play as usual.
 
-Para desinstalar, apague os três DLLs.
+To uninstall, delete the three DLLs.
 
-Funciona junto com o [FH2 Extra Options](https://github.com/RokkuDayo/ForzaHorizon2_ExtraOptions), que fica em `data\bin` e não conflita com este mod.
+It works alongside [FH2 Extra Options](https://github.com/RokkuDayo/ForzaHorizon2_ExtraOptions), which lives in `data\bin` and does not conflict with this mod.
 
-## Teclas
+## Keys
 
-| Tecla | Ação |
+| Key | Action |
 |---|---|
-| **F11** | Liga/desliga o FSR (bom para comparar) |
-| F9 | Overlay de debug dos motion vectors: desligado, transparente ou opaco |
-| F10 | Escala de brilho do overlay |
+| **F11** | Toggle FSR on/off (handy for comparisons) |
+| F9 | Motion-vector debug overlay: off, blended or opaque |
+| F10 | Overlay brightness scale |
 
-O log fica em `fh2_fsr.log`, na pasta do Azimuth.
+The log is written to `fh2_fsr.log` in the Azimuth folder.
 
-## Como funciona
+## How it works
 
-O FH2 nunca teve TAA, e o FSR precisa de quatro coisas que o jogo não entrega prontas. O mod é um proxy de `dxgi.dll` que faz hook nas vtables do D3D12 do Azimuth e monta cada uma delas:
+FH2 never had TAA, and FSR needs four things the game doesn't provide out of the box. The mod is a `dxgi.dll` proxy that hooks Azimuth's D3D12 vtables and builds each of them:
 
-- **Jitter de subpixel:** desloca o viewport das passadas da cena, só enquanto o depth buffer da cena está bound, seguindo a sequência oficial do FSR.
-- **Motion vectors em resolução cheia:** o motion blur do FH2 já calcula a reprojeção da câmera e de cada carro (a matriz é escolhida pelo stencil de cada objeto), mas em meia resolução e com o vetor limitado. O mod roda uma variante desse shader em resolução cheia, sem esse limite, com os mesmos bindings do jogo.
-- **Cor HDR e profundidade:** o mod pega os alvos do resolve da cena, antes do tonemap e do HUD.
-- **Despacho do FSR:** o FSR roda dentro da própria command list do jogo, logo antes do tonemap. A saída é copiada de volta para a cor da cena, e depois o mod restaura heaps, root signatures, tabelas e PSO do jogo.
+- **Sub-pixel jitter:** offsets the viewport of the scene passes, only while the scene depth buffer is bound, following FSR's official jitter sequence.
+- **Full-resolution motion vectors:** FH2's motion blur already computes the reprojection of the camera and of each car (the matrix is picked by each object's stencil value), but at half resolution and with a clamped vector. The mod runs a variant of that shader at full resolution, without the clamp, using the game's own bindings.
+- **HDR colour and depth:** the mod takes the targets of the scene resolve, before tonemapping and the HUD.
+- **FSR dispatch:** FSR runs inside the game's own command list, right before the tonemap. Its output is copied back into the scene colour, and the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
 
-As passadas do jogo são identificadas pelo checksum DXBC dos pixel shaders, e o resolve também pelos formatos dos alvos.
+The game's passes are identified by the DXBC checksums of their pixel shaders, and the resolve also by its render-target formats.
 
-## Limitações conhecidas
+## Known limitations
 
-- Os shaders reconhecidos valem para o **FH2 1.0.0.64**. Storm Island e Fast & Furious podem precisar de ajustes.
-- Rodas girando e vegetação balançando não têm motion vectors próprios.
-- Não há máscara reativa, então partículas e transparências podem deixar um leve rastro.
-- Os parâmetros de câmera passados ao FSR (near, far e FOV) são aproximados.
+- The recognised shaders are for **FH2 1.0.0.64**. Storm Island and Fast & Furious may need adjustments.
+- Spinning wheels and swaying foliage don't have their own motion vectors.
+- There is no reactive mask, so particles and transparencies may leave a slight trail.
+- The camera parameters passed to FSR (near, far and FOV) are approximations.
 
-## Compilando
+## Building
 
-Precisa do [Zig 0.15.2](https://ziglang.org/download/), de Git e de um shell POSIX (o Git Bash no Windows serve).
+Requires [Zig 0.15.2](https://ziglang.org/download/), Git and a POSIX shell (Git Bash works on Windows).
 
 ```sh
-ZIG=/caminho/para/zig ./build.sh           # build/dxgi.dll
-ZIG=/caminho/para/zig ./build.sh release   # e dist/FH2-FSR4-<versão>.zip
+ZIG=/path/to/zig ./build.sh           # build/dxgi.dll
+ZIG=/path/to/zig ./build.sh release   # plus dist/FH2-FSR4-<version>.zip
 ```
 
-O script baixa do repositório oficial da AMD os headers do FSR SDK v2.3.0. No modo `release`, baixa também os DLLs assinados da AMD.
+The script downloads the FSR SDK v2.3.0 headers from AMD's official repository. In `release` mode it also downloads AMD's signed DLLs.
 
-## Licenças
+## Licenses
 
-- O código deste repositório está sob a licença MIT (veja [LICENSE](LICENSE)).
-- Os DLLs do FSR são da AMD e são redistribuídos sem modificação, nos termos da licença do FSR SDK, que vai junto no zip de release como `LICENSE-AMD-FSR.txt`.
+- The code in this repository is under the MIT license (see [LICENSE](LICENSE)).
+- The FSR DLLs belong to AMD and are redistributed unmodified under the FSR SDK license, which ships in the release zip as `LICENSE-AMD-FSR.txt`.

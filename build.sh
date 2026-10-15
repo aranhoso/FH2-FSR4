@@ -42,7 +42,7 @@ if [ "$1" = "release" ]; then
     cp build/dxgi.dll "$PKG/amd_fidelityfx_loader_dx12.dll" "$PKG/amd_fidelityfx_upscaler_dx12.dll" "$OUT/"
     cp "$FFX/Kits/FidelityFX/docs/license.md" "$OUT/LICENSE-AMD-FSR.txt"
     cp LICENSE "$OUT/LICENSE.txt"
-    cp release/LEIA-ME.txt "$OUT/"
+    cp release/README.txt "$OUT/"
     if command -v zip >/dev/null 2>&1; then
         (cd dist && zip -q -r "FH2-FSR4-$VERSION.zip" "FH2-FSR4-$VERSION")
     else
