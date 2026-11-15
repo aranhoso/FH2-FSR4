@@ -1,18 +1,24 @@
-/* FH2 FSR: FSR 4 Native AA for Azimuth (jitter, full-resolution motion vectors).
+/* FH2 FSR: FSR 4 for Azimuth (jitter, full-resolution motion vectors, Native AA / upscaling).
    Loaded as dxgi.dll next to azimuth.exe. Hooks D3D12CreateDevice through the exe's
-   import table, then device / command-list / factory / swap-chain vtables.
+   import table, then device / command-list / factory vtables.
 
    Azimuth 1.x compatibility (ported from the Azimuth-DLAA codebase, which runs on
    Azimuth 1.0.3/1.0.4):
-   - No Present/ResizeBuffers hooks. The Steam overlay hooks Present too, and with both
-     mods on the swap chain's vtable the game crashed at startup when launched from Steam
-     (the overlay's Present calling itself until the stack overflowed). Azimuth 1.x may
-     also own multiple swap chains, whose Presents are not a reliable scene-frame boundary.
-     Frame counting and the end-of-frame jitter state are driven from the scene resolve
-     instead, and the F11 hotkey is polled from a dedicated thread.
-   - The recognised passes are the Azimuth 1.x shader hashes, FSR is dispatched right after
-     the scene resolve draw, and the passes may be issued as indexed draws, so
-     DrawIndexedInstanced is hooked as well. */
+   - No Present hooks: the Steam overlay hooks Present too, and double-hooking the swap
+     chain vtable crashed the game at startup when launched from Steam. Frame counting and
+     fsr_end_frame are driven from the scene resolve instead; F11 is polled from a thread.
+   - The recognised passes are the Azimuth 1.x shader hashes; passes may be indexed draws,
+     so DrawIndexedInstanced is hooked too.
+
+   Upscaling: Azimuth 1.x creates two swap chains — a display-sized window chain
+   (OS-presented) and a game chain created at render resolution (azimuth.ini
+   resolution/aspect) which it then resizes to display res, so the game itself stretches
+   its frame into it and the window copy is 1:1. To upscale with FSR we clamp the game
+   chain's ResizeBuffers back to render res (the game then renders 1:1 into a render-sized
+   back buffer and Azimuth's game->window display pass does the stretch), and we replace
+   that display-pass draw with an FSR dispatch: color = the game chain's current back
+   buffer, output copied into the window back buffer. When render == display, Native AA at
+   the scene resolve is used instead (unchanged behavior). */
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
@@ -105,31 +111,9 @@ typedef struct {
     ID3D12Resource *resource;
     DXGI_FORMAT format;   /* view format, or resource format when the view had no desc */
     UINT width, height;
-    UINT8 kind;           /* 0 none, 1 RTV, 2 DSV, 3 SRV */
-    SIZE_T heap_cpu;      /* cpu base of the heap this handle belongs to (0 = unknown) */
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;  /* saved desc when kind == 3 */
 } ViewEntry;
-
-/* Live shader-visible heaps (cpu base + span), refreshed on SetDescriptorHeaps. Handles are
-   only unique per heap, so view entries are tagged with their heap to avoid cross-heap
-   collisions when resolving gpu handles back to cpu handles. */
-static struct {
-    SIZE_T cpu;
-    UINT64 span;
-} live_heaps[16];
-static int live_heaps_n;
-
-static SIZE_T live_heap_of(SIZE_T handle) {
-    for (int i = 0; i < live_heaps_n; ++i) {
-        if (handle >= live_heaps[i].cpu && handle < live_heaps[i].cpu + live_heaps[i].span) {
-            return live_heaps[i].cpu;
-        }
-    }
-    return 0;
-}
 #define MAX_VIEWS 65536
 static ViewEntry views[MAX_VIEWS];
-static UINT scene_w, scene_h;   /* render size, from the scene colour at the resolve */
 
 /* Motion-vector target. */
 static ID3D12Resource *mv_tex;
@@ -141,23 +125,27 @@ static ID3D12Resource *retired[16];
 static LONG64 retired_at[16];
 static SRWLOCK mv_lock = SRWLOCK_INIT;
 
-/* Azimuth 1.x owns two swap chains: the window chain (display resolution, OS-presented, created
-   first) and the game chain (render resolution from azimuth.ini, created second, later resized
-   to display res — the game then stretches its own frame into it). We only record the
-   creation-time descs (plain struct copies; no COM calls on the chains at all, so nothing can
-   dangle and ReShade/Special K keep working). When render < display, FSR upscales the HDR
-   scene colour at the resolve and the game's scene-colour SRV descriptors are redirected to the
-   upscaled texture, so the game's own present pass tonemaps the upscaled image into the
-   display-sized back buffer (pillarbox handled by the game, HUD stays crisp). */
+/* The two swap chains. Only the creation desc and the raw object pointer are recorded in
+   the factory hook (no COM calls in the creation path: with ReShade also hooking the
+   factory, side effects there made the second CreateSwapChainForHwnd fail). Everything
+   else happens later, outside the creation path. */
+static IUnknown *chain_obj[2];              /* 0: window (display), 1: game (render) — creation order */
 static DXGI_SWAP_CHAIN_DESC1 chain_desc[2];
 static int chain_count;
-static UINT disp_w, disp_h;                  /* window chain (display) size, from its creation desc */
-static int g_upscale;                        /* render < display: upscale the scene at the resolve */
+static UINT disp_w, disp_h;                 /* window chain size */
+static UINT rend_w, rend_h;                 /* game chain creation size */
+static int g_upscale;                       /* render < display */
+static ID3D12Resource *window_bb[8];       /* window chain back buffers (raw refs) */
+static UINT window_bb_n;
+static ID3D12Resource *game_bb_cache;
+static volatile LONG game_bb_state = D3D12_RESOURCE_STATE_COMMON;
+static LONG64 game_bb_cache_frame = -1;
 
-/* fh2_fsr.ini next to the DLL: [fsr] mode=auto|native|upscale, hdr=auto|on|off, sharpness=0..1 */
-static int cfg_mode;                         /* 0 auto, 1 native, 2 upscale */
-static int cfg_hdr = -1;                     /* -1 auto, 0 off, 1 on */
+/* fh2_fsr.ini next to the DLL: [fsr] mode=auto|native|upscale, hdr=auto|on|off, sharpness, debug_blink */
+static int cfg_mode;                        /* 0 auto, 1 native, 2 upscale */
+static int cfg_hdr = -1;                    /* -1 auto, 0 off, 1 on */
 static float cfg_sharpness = -1.0f;
+static int cfg_debug_blink;
 
 /* ---------------------------------------------------------------- originals */
 
@@ -176,16 +164,14 @@ static void(STDMETHODCALLTYPE *real_SetDescriptorHeaps)(ID3D12GraphicsCommandLis
 static void(STDMETHODCALLTYPE *real_SetComputeRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
 static void(STDMETHODCALLTYPE *real_SetGraphicsRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
 static void(STDMETHODCALLTYPE *real_SetGraphicsRootDescriptorTable)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
-static void(STDMETHODCALLTYPE *real_SetGraphicsRootShaderResourceView)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateRenderTargetView)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateDepthStencilView)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
-static void(STDMETHODCALLTYPE *real_CreateShaderResourceView)(ID3D12Device *, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
-/* NOTE: CopyDescriptors/CopyDescriptorsSimple are deliberately NOT hooked: AMD's amdxc64 shim
-   hooks the same device vtable slots, and double-patching made it crash at startup (index -1). */
 static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
 static HRESULT(STDMETHODCALLTYPE *real_CreateSwapChainForHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
+static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers1)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
 /* ---------------------------------------------------------------- shaders */
 
@@ -365,6 +351,7 @@ typedef struct {
     UINT num_rtv;
     BOOL rtv_single;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[8];
+    BOOL win_bb;         /* rtv[0] is a window-chain back buffer: Azimuth's display pass */
     BOOL has_dsv;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv;
     BOOL dsv_scene;      /* the scene depth buffer is bound: viewports get the FSR jitter */
@@ -373,15 +360,10 @@ typedef struct {
     D3D12_VIEWPORT vp[4]; /* as the game set them (unjittered) */
     D3D12_RECT sc[4];
     UINT num_heaps;
-    ID3D12DescriptorHeap *heaps[4];
-    D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu[4];  /* per bound heap, valid when num_heaps > 0 */
-    D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu[4];
-    UINT heap_num[4];
+    ID3D12DescriptorHeap *heaps[2];
     ID3D12RootSignature *compute_rs;
     UINT tables_mask;
     D3D12_GPU_DESCRIPTOR_HANDLE tables[32];
-    UINT root_srv_mask;
-    D3D12_GPU_DESCRIPTOR_HANDLE root_srv[32];
 } ListState;
 
 /* Azimuth creates command lists continually and never tells us when one dies, so this
@@ -435,8 +417,7 @@ static UINT view_hash(SIZE_T handle) {
     return (UINT)(((UINT64)handle * 0x9E3779B97F4A7C15ull) >> 50) & (MAX_VIEWS - 1);
 }
 
-static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI_FORMAT view_format,
-                        UINT8 kind, const D3D12_SHADER_RESOURCE_VIEW_DESC *srv_desc) {
+static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI_FORMAT view_format) {
     UINT i = view_hash(h.ptr);
     ViewEntry *e = NULL;
     for (UINT k = 0; k < 64; ++k) {
@@ -465,18 +446,6 @@ static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI
     e->height = ht;
     e->resource = res;
     e->handle = h.ptr;
-    e->kind = kind;
-    e->heap_cpu = live_heap_of(h.ptr);
-    if (kind == 3) {
-        if (srv_desc) {
-            e->srv_desc = *srv_desc;
-        } else {
-            memset(&e->srv_desc, 0, sizeof(e->srv_desc));
-            e->srv_desc.Format = DXGI_FORMAT_UNKNOWN;
-            e->srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            e->srv_desc.Texture2D.MipLevels = 1;
-        }
-    }
 }
 
 static const ViewEntry *view_find(SIZE_T handle) {
@@ -497,24 +466,15 @@ static void STDMETHODCALLTYPE hook_CreateRenderTargetView(ID3D12Device *dev, ID3
                                                           const D3D12_RENDER_TARGET_VIEW_DESC *desc,
                                                           D3D12_CPU_DESCRIPTOR_HANDLE h) {
     real_CreateRenderTargetView(dev, res, desc, h);
-    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 1, NULL);
+    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
 
 static void STDMETHODCALLTYPE hook_CreateDepthStencilView(ID3D12Device *dev, ID3D12Resource *res,
                                                           const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
                                                           D3D12_CPU_DESCRIPTOR_HANDLE h) {
     real_CreateDepthStencilView(dev, res, desc, h);
-    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 2, NULL);
+    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
 }
-
-static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, ID3D12Resource *res,
-                                                           const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
-                                                           D3D12_CPU_DESCRIPTOR_HANDLE h) {
-    real_CreateShaderResourceView(dev, res, desc, h);
-    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 3, desc);
-}
-
-
 
 /* The scene depth buffer: depth+stencil at the scene colour's size (found at the resolve). */
 static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
@@ -526,6 +486,15 @@ static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
     D3D12_RESOURCE_DESC d;
     scene_color->lpVtbl->GetDesc(scene_color, &d);
     return depth_stencil && e->width == d.Width && e->height == d.Height;
+}
+
+static BOOL is_window_bb(ID3D12Resource *r) {
+    for (UINT i = 0; i < window_bb_n; ++i) {
+        if (window_bb[i] == r) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 /* ---------------------------------------------------------------- list hooks */
@@ -578,6 +547,13 @@ static void STDMETHODCALLTYPE hook_OMSetRenderTargets(ID3D12GraphicsCommandList 
         if (rt && n) {
             memcpy(s->rtv, rt, (single ? 1 : s->num_rtv) * sizeof(*rt));
         }
+        s->win_bb = FALSE;
+        if (rt && n) {
+            const ViewEntry *c = view_find(rt[0].ptr);
+            if (c && c->resource && is_window_bb(c->resource)) {
+                s->win_bb = TRUE;
+            }
+        }
         s->has_dsv = ds != NULL;
         if (ds) {
             s->dsv = *ds;
@@ -617,81 +593,13 @@ static void STDMETHODCALLTYPE hook_RSSetScissorRects(ID3D12GraphicsCommandList *
     real_RSSetScissorRects(cl, n, r);
 }
 
-static UINT g_srv_inc;   /* CBV_SRV_UAV descriptor increment, set when the device is hooked */
-
 static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList *cl, UINT n, ID3D12DescriptorHeap *const *h) {
-    real_SetDescriptorHeaps(cl, n, h);
     ListState *s = state_for(cl);
     if (s) {
-        s->num_heaps = n > 4 ? 4 : n;
+        s->num_heaps = n > 2 ? 2 : n;
         memcpy(s->heaps, h, s->num_heaps * sizeof(*h));
-        for (UINT i = 0; i < s->num_heaps; ++i) {
-            D3D12_DESCRIPTOR_HEAP_DESC d;
-            s->heaps[i]->lpVtbl->GetDesc(s->heaps[i], &d);
-            s->heap_num[i] = d.NumDescriptors;
-            if (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
-                s->heaps[i]->lpVtbl->GetCPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_cpu[i]);
-                s->heaps[i]->lpVtbl->GetGPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_gpu[i]);
-                UINT inc = g_srv_inc ? g_srv_inc : 32;
-                SIZE_T cpu = s->heap_cpu[i].ptr;
-                UINT64 span = (UINT64)d.NumDescriptors * inc;
-                int found = 0;
-                for (int k = 0; k < live_heaps_n; ++k) {
-                    if (live_heaps[k].cpu == cpu) {
-                        found = 1;
-                        break;
-                    }
-                }
-                if (!found && live_heaps_n < 16) {
-                    live_heaps[live_heaps_n].cpu = cpu;
-                    live_heaps[live_heaps_n].span = span;
-                    ++live_heaps_n;
-                }
-            } else {
-                s->heap_gpu[i].ptr = 0;
-                s->heap_cpu[i].ptr = 0;
-                s->heap_num[i] = 0;
-            }
-        }
     }
-}
-
-/* GPU handle -> CPU handle for the currently bound shader-visible heaps. 0 when unknown.
-   *heap_cpu_out (optional) receives the owning heap's cpu base for heap-tag verification. */
-static SIZE_T gpu_to_cpu(ListState *s, D3D12_GPU_DESCRIPTOR_HANDLE g, SIZE_T *heap_cpu_out) {
-    for (UINT i = 0; i < s->num_heaps; ++i) {
-        if (!s->heap_gpu[i].ptr || !g_srv_inc) {
-            continue;
-        }
-        UINT64 base = s->heap_gpu[i].ptr, span = (UINT64)s->heap_num[i] * g_srv_inc;
-        if (g.ptr >= base && g.ptr < base + span) {
-            if (heap_cpu_out) {
-                *heap_cpu_out = s->heap_cpu[i].ptr;
-            }
-            return s->heap_cpu[i].ptr + (g.ptr - base);
-        }
-    }
-    return 0;
-}
-
-/* A view entry is trustworthy for a handle resolved through heap with base heap_cpu when the
-   entry was recorded in that same heap (or its heap is unknown). */
-static const ViewEntry *view_find_heap(SIZE_T handle, SIZE_T heap_cpu) {
-    const ViewEntry *e = view_find(handle);
-    if (e && e->handle && (e->heap_cpu == 0 || e->heap_cpu == heap_cpu)) {
-        return e;
-    }
-    return NULL;
-}
-
-static void STDMETHODCALLTYPE hook_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList *cl, UINT index,
-                                                                    D3D12_GPU_DESCRIPTOR_HANDLE h) {
-    ListState *s = state_for(cl);
-    if (s && index < 32) {
-        s->root_srv[index] = h;
-        s->root_srv_mask |= 1u << index;
-    }
-    real_SetGraphicsRootShaderResourceView(cl, index, h);
+    real_SetDescriptorHeaps(cl, n, h);
 }
 
 static void STDMETHODCALLTYPE hook_SetComputeRootSignature(ID3D12GraphicsCommandList *cl, ID3D12RootSignature *rs) {
@@ -706,7 +614,6 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootSignature(ID3D12GraphicsComman
     ListState *s = state_for(cl);
     if (s) {
         s->tables_mask = 0;
-        s->root_srv_mask = 0;
     }
     real_SetGraphicsRootSignature(cl, rs);
 }
@@ -722,8 +629,8 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootDescriptorTable(ID3D12Graphics
 }
 
 static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
-    ID3D12Resource *color = scene_color, *depth = scene_depth;
-    if (color || depth) {
+    ID3D12Resource *color = scene_color, *depth = scene_depth, *bb = game_bb_cache;
+    if (color || depth || bb) {
         for (UINT i = 0; i < n; ++i) {
             if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
                 continue;
@@ -732,6 +639,8 @@ static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl
                 InterlockedExchange(&scene_color_state, (LONG)b[i].Transition.StateAfter);
             } else if (b[i].Transition.pResource == depth) {
                 InterlockedExchange(&scene_depth_state, (LONG)b[i].Transition.StateAfter);
+            } else if (b[i].Transition.pResource == bb) {
+                InterlockedExchange(&game_bb_state, (LONG)b[i].Transition.StateAfter);
             }
         }
     }
@@ -777,10 +686,8 @@ static D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle(ID3D12DescriptorHeap *heap, UINT i
     return h;
 }
 
-static ID3D12DescriptorHeap *srv_heap;   /* shader visible, slot 0: FSR output SRV for root-SRV rebinding */
-
 static int ensure_heaps(void) {
-    if (rtv_heap && srv_heap) {
+    if (rtv_heap) {
         return 1;
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd;
@@ -791,12 +698,6 @@ static int ensure_heaps(void) {
         return 0;
     }
     rtv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(g_device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 8;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(ID3D12Device_CreateDescriptorHeap(g_device, &hd, &IID_ID3D12DescriptorHeap, (void **)&srv_heap))) {
-        return 0;
-    }
     return 1;
 }
 
@@ -854,6 +755,7 @@ static int ensure_mv(UINT w, UINT h) {
 
 static volatile LONG64 mv_seq;          /* motion-vector passes recorded */
 static LONG64 fsr_mv_seq;                /* the motion-vector pass the last FSR dispatch used */
+static volatile LONG fallback_active;
 
 static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
                            UINT vc, UINT ic, UINT sv, UINT si) {
@@ -948,20 +850,15 @@ static BOOL note_scene_resources(ListState *s) {
     if (c->resource != scene_color || d->resource != scene_depth) {
         scene_color = c->resource;
         scene_depth = d->resource;
-        scene_w = c->width;
-        scene_h = c->height;
         log_msg("scene colour %p (%ux%u fmt %d), scene depth %p (%ux%u fmt %d)", (void *)scene_color, c->width,
                 c->height, (int)c->format, (void *)scene_depth, d->width, d->height, (int)d->format);
     }
     return TRUE;
 }
 
-/* Once per scene frame, from the resolve draw: old motion-vector textures are released 8 frames after
-   they were replaced, when the GPU is done with them. This used to be counted in a Present
-   hook, but the Steam overlay hooks Present too, and with both of them on the swap chain's
-   vtable the game crashed as it started, launched from Steam (the overlay's Present calling
-   itself until the stack overflowed). Azimuth may also own multiple swap chains, whose
-   Presents are not a reliable scene-frame boundary. */
+/* Once per scene frame, from the resolve draw: old motion-vector textures are released 8
+   frames after they were replaced, when the GPU is done with them. Not driven from Present
+   (Steam overlay double-hook crash; Azimuth 1.x owns multiple swap chains). */
 static void count_frame(void) {
     InterlockedIncrement64(&present_count);
     AcquireSRWLockExclusive(&mv_lock);
@@ -979,9 +876,9 @@ static int mv_status(void) {
     LONG64 seq = mv_seq;
     static LONG stale_resolves;
     if (seq == fsr_mv_seq) {
-        /* Some game states keep running the scene resolve / display pass while the velocity
-           pass stops (pause/photo). Never feed stale vectors back into FSR. After two
-           consecutive frames with no fresh MV pass, switch to a history-reset fallback. */
+        /* Some game states keep running while the velocity pass stops (pause/photo).
+           Never feed stale vectors back into FSR; after two consecutive frames with no
+           fresh MV pass, switch to a history-reset fallback. */
         if (InterlockedIncrement(&stale_resolves) < 2) {
             return 0;
         }
@@ -992,8 +889,6 @@ static int mv_status(void) {
     return 1;
 }
 
-static volatile LONG fallback_active;
-
 /* R16G16_FLOAT zero motion is valid for a disconnected/static frame. */
 static void clear_mv(ID3D12GraphicsCommandList *cl) {
     const FLOAT zero[4] = {0, 0, 0, 0};
@@ -1003,179 +898,7 @@ static void clear_mv(ID3D12GraphicsCommandList *cl) {
     transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-/* In upscale mode, the game's scene-colour bindings must sample the FSR output instead of the
-   render-sized scene colour. Two binding styles are covered:
-   - descriptor tables: the SRV descriptors that reference the scene colour are overwritten with
-     an SRV of the FSR output (handles cached per frame, re-applied before every draw because the
-     game rewrites its heaps per pass, which would otherwise clobber a resolve-time overwrite);
-   - root SRVs: the root parameter is rebound to our own heap slot holding the output SRV.
-   The FSR output is never released by fsr.c, so descriptors can never dangle. */
-static ID3D12Resource *volatile g_upscale_tex;
-static D3D12_GPU_DESCRIPTOR_HANDLE g_up_gpu;
-static SIZE_T scene_srv[16];
-static int scene_srv_n;
-static int cfg_debug_blink;
-
-/* A descriptor is "the scene" if it is an SRV on a render-sized HDR (R11G11B10) texture —
-   that covers the scene colour itself and any staging copies of it. */
-static int is_scene_srv(const ViewEntry *e) {
-    return e && e->kind == 3 && e->resource && e->format == DXGI_FORMAT_R11G11B10_FLOAT &&
-           e->width == scene_w && e->height == scene_h;
-}
-
-static void overwrite_srv(ID3D12Resource *up, SIZE_T cpu_handle) {
-    const ViewEntry *e = view_find(cpu_handle);
-    if (!is_scene_srv(e) || !g_device) {
-        return;
-    }
-    D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
-    if (d.Format == DXGI_FORMAT_UNKNOWN) {
-        D3D12_RESOURCE_DESC ud;
-        up->lpVtbl->GetDesc(up, &ud);
-        d.Format = ud.Format;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    h.ptr = cpu_handle;
-    ID3D12Device_CreateShaderResourceView(g_device, up, &d, h);
-}
-
-/* Collect the scene's SRV handles and point them at the FSR output. Called at the resolve. */
-static void redirect_scene_srv(ID3D12Resource *up) {
-    if (!up || !scene_color || !g_device || !scene_w) {
-        return;
-    }
-    scene_srv_n = 0;
-    int n = 0;
-    for (UINT i = 0; i < MAX_VIEWS; ++i) {
-        ViewEntry *e = &views[i];
-        if (e->handle && is_scene_srv(e)) {
-            if (scene_srv_n < 16) {
-                scene_srv[scene_srv_n++] = e->handle;
-            }
-            overwrite_srv(up, e->handle);
-            ++n;
-        }
-    }
-    if (ensure_heaps()) {
-        D3D12_CPU_DESCRIPTOR_HANDLE c = cpu_handle(srv_heap, 0, g_srv_inc);
-        ID3D12Device_CreateShaderResourceView(g_device, up, NULL, c);
-        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
-    }
-    g_upscale_tex = up;
-    static LONG redirected;
-    if (n && (InterlockedIncrement(&redirected) == 1 || redirected % 600 == 0)) {
-        log_msg("scene colour SRVs redirected to the FSR output (%d handle(s), frame %ld)", n, redirected);
-    }
-}
-
-/* Point the cached scene-colour SRV handles back at the scene colour (debug blink off-frames). */
-static void restore_scene_srv(void) {
-    if (!scene_color || !g_device) {
-        return;
-    }
-    for (int i = 0; i < scene_srv_n; ++i) {
-        const ViewEntry *e = view_find(scene_srv[i]);
-        if (e && e->kind == 3 && e->handle && e->resource) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
-            if (d.Format == DXGI_FORMAT_UNKNOWN) {
-                D3D12_RESOURCE_DESC rd;
-                scene_color->lpVtbl->GetDesc(scene_color, &rd);
-                d.Format = rd.Format;
-            }
-            D3D12_CPU_DESCRIPTOR_HANDLE h;
-            h.ptr = scene_srv[i];
-            ID3D12Device_CreateShaderResourceView(g_device, scene_color, &d, h);
-        }
-    }
-}
-
-/* Re-apply the redirect before a draw: the game may have rewritten descriptors or re-set root
-   SRVs since the resolve. Also reports (once per PSO) whether a draw into a display-sized
-   target binds the scene colour at all. */
-static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s) {
-    ID3D12Resource *up = g_upscale_tex;
-    if (!g_upscale || !up || !scene_color) {
-        return;
-    }
-    for (int i = 0; i < scene_srv_n; ++i) {
-        overwrite_srv(up, scene_srv[i]);
-    }
-    int bound_scene = 0;
-    for (UINT i = 0; i < 32; ++i) {
-        if (s->root_srv_mask & (1u << i)) {
-            SIZE_T heap_cpu = 0;
-            SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i], &heap_cpu);
-            const ViewEntry *e = cpu ? view_find_heap(cpu, heap_cpu) : NULL;
-            if (is_scene_srv(e)) {
-                real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
-                ++bound_scene;
-            }
-        }
-        if (s->tables_mask & (1u << i)) {
-            SIZE_T heap_cpu = 0;
-            SIZE_T base = gpu_to_cpu(s, s->tables[i], &heap_cpu);
-            if (base && g_srv_inc) {
-                /* a table is a contiguous descriptor range; scan it for the scene */
-                for (UINT k = 0; k < 64; ++k) {
-                    const ViewEntry *e = view_find_heap(base + (SIZE_T)k * g_srv_inc, heap_cpu);
-                    if (!e || !e->handle) {
-                        break;
-                    }
-                    if (is_scene_srv(e)) {
-                        overwrite_srv(up, base + (SIZE_T)k * g_srv_inc);
-                        ++bound_scene;
-                    }
-                }
-            }
-        }
-    }
-    /* diagnostic: what does a draw into a display-sized target actually sample? */
-    if (s->num_rtv && disp_w) {
-        const ViewEntry *c = view_find(s->rtv[0].ptr);
-        if (c && c->resource && c->width == disp_w && c->height == disp_h) {
-            static ID3D12PipelineState *seen[8];
-            static int seen_n;
-            int i;
-            for (i = 0; i < seen_n; ++i) {
-                if (seen[i] == s->pso) {
-                    return;
-                }
-            }
-            if (seen_n < 8) {
-                seen[seen_n++] = s->pso;
-            }
-            log_msg("display-target draw: pso %p vp %.0fx%.0f+%.0f+%.0f scene bindings %d heaps %u", (void *)s->pso,
-                    s->num_vp ? s->vp[0].Width : 0.0f, s->num_vp ? s->vp[0].Height : 0.0f,
-                    s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f, bound_scene, s->num_heaps);
-            for (UINT t = 0; t < 32; ++t) {
-                if (!(s->tables_mask & (1u << t)) && !(s->root_srv_mask & (1u << t))) {
-                    continue;
-                }
-                D3D12_GPU_DESCRIPTOR_HANDLE g = (s->tables_mask & (1u << t)) ? s->tables[t] : s->root_srv[t];
-                SIZE_T heap_cpu = 0;
-                SIZE_T base = gpu_to_cpu(s, g, &heap_cpu);
-                if (!base || !g_srv_inc) {
-                    log_msg("  binding %u: gpu %llx not resolvable (heaps %u)", t, (unsigned long long)g.ptr, s->num_heaps);
-                    continue;
-                }
-                for (UINT k = 0; k < 16; ++k) {
-                    const ViewEntry *e = view_find_heap(base + (SIZE_T)k * g_srv_inc, heap_cpu);
-                    if (!e || !e->handle) {
-                        log_msg("  binding %u[%u]: ?", t, k);
-                        continue;
-                    }
-                    log_msg("  binding %u[%u]: res %p %ux%u fmt %d kind %u%s", t, k, (void *)e->resource, e->width,
-                            e->height, (int)e->format, e->kind, is_scene_srv(e) ? " <== scene" : "");
-                }
-            }
-        }
-    }
-}
-
-/* FSR on the HDR scene colour at the resolve. Native AA (render == display): output is copied
-   back into the scene colour in place. Upscale (render < display): the output is sized to the
-   render area fitted into the display (the pillarbox rect the game itself draws into) and the
-   scene colour's SRV descriptors are redirected to it. */
+/* Native AA: FSR on the HDR scene colour at render resolution, result copied back in place. */
 static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (!fsr_enabled() || !scene_color || !scene_depth || !mv_tex) {
         return;
@@ -1202,87 +925,195 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     D3D12_RESOURCE_DESC cd;
     scene_color->lpVtbl->GetDesc(scene_color, &cd);
     UINT w = (UINT)cd.Width, h = cd.Height;
-
-    if (!g_upscale && disp_w) {
-        /* resolve the mode once: scene (render) area vs window-chain (display) area */
-        g_upscale = (UINT64)w * h < (UINT64)disp_w * disp_h;
-        if (cfg_mode == 1) {
-            g_upscale = 0;
-        }
-        if (g_upscale) {
-            log_msg("upscale mode: render %ux%u < display %ux%u", w, h, disp_w, disp_h);
-        }
-    }
-    UINT out_w = w, out_h = h;
-    if (g_upscale && disp_w) {
-        /* fit the render area into the display (what the game's present pass draws into) */
-        float scale = (float)disp_w / (float)w;
-        if ((float)disp_h / (float)h < scale) {
-            scale = (float)disp_h / (float)h;
-        }
-        out_w = (UINT)(w * scale + 0.5f);
-        out_h = (UINT)(h * scale + 0.5f);
-        if (out_w > disp_w) out_w = disp_w;
-        if (out_h > disp_h) out_h = disp_h;
-    }
-
     AcquireSRWLockShared(&mv_lock);
     if (fallback) {
         clear_mv(cl);
-        /* fsr_end_frame(0) below forces reset and keeps jitter disabled. */
     }
     int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                     out_w, out_h);
+                     w, h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
     ID3D12Resource *out = ok ? fsr_output() : NULL;
-    static LONG fsr_frames;
-    LONG n = InterlockedIncrement(&fsr_frames);
     if (ok && out) {
-        if (g_upscale) {
-            /* debug_blink: alternate 30 frames FSR / 30 frames original, so the effect is visible */
-            if (cfg_debug_blink && (n / 30) % 2 == 1) {
-                g_upscale_tex = NULL;
-                restore_scene_srv();
-                if (n % 30 == 1) {
-                    log_msg("debug blink: showing the game's own stretch (frame %ld)", n);
-                }
-            } else {
-                redirect_scene_srv(out);
-            }
-        } else {
-            transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_DEST);
-            transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            cl->lpVtbl->CopyResource(cl, scene_color, out);
-            transition(cl, out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            transition(cl, scene_color, D3D12_RESOURCE_STATE_COPY_DEST, (D3D12_RESOURCE_STATES)color_state);
-        }
+        transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->lpVtbl->CopyResource(cl, scene_color, out);
+        transition(cl, out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(cl, scene_color, D3D12_RESOURCE_STATE_COPY_DEST, (D3D12_RESOURCE_STATES)color_state);
     }
     ReleaseSRWLockShared(&mv_lock);
     InterlockedExchange(&scene_color_state, color_state);
     InterlockedExchange(&scene_depth_state, depth_state);
     *s = saved;
     restore_after_fsr(cl, s);
-    /* In normal gameplay, a successful FSR dispatch enables next-frame jitter. Fallback
-       frames deliberately remain disconnected from history: fsr_end_frame(0) keeps reset
-       asserted and suppresses camera jitter until fresh MVs return. */
     fsr_end_frame((!fallback && ok) ? 1 : 0);
+    static LONG fsr_frames;
+    LONG n = InterlockedIncrement(&fsr_frames);
     if (ok && (n == 1 || n % 600 == 0)) {
-        log_msg("FSR frame %ld (%s, render %ux%u -> out %ux%u)", n, g_upscale ? "upscale" : "native", w, h, out_w, out_h);
+        log_msg("FSR frame %ld (native, %ux%u)", n, w, h);
     }
 }
 
+/* The game chain's current back buffer (render resolution), refreshed once per frame. */
+static ID3D12Resource *current_game_bb(void) {
+    if (chain_count < 2 || !chain_obj[1]) {
+        return NULL;
+    }
+    if (game_bb_cache && game_bb_cache_frame == present_count) {
+        return game_bb_cache;
+    }
+    IDXGISwapChain3 *sc3 = NULL;
+    if (FAILED(IUnknown_QueryInterface(chain_obj[1], &IID_IDXGISwapChain3, (void **)&sc3))) {
+        return NULL;
+    }
+    UINT i = IDXGISwapChain3_GetCurrentBackBufferIndex(sc3);
+    ID3D12Resource *r = NULL;
+    HRESULT hr = IDXGISwapChain_GetBuffer((IDXGISwapChain *)sc3, i, &IID_ID3D12Resource, (void **)&r);
+    IDXGISwapChain3_Release(sc3);
+    if (FAILED(hr) || !r) {
+        return NULL;
+    }
+    if (game_bb_cache && game_bb_cache_frame != present_count) {
+        ID3D12Resource_Release(game_bb_cache);
+    }
+    game_bb_cache = r;
+    game_bb_cache_frame = present_count;
+    return r;
+}
+
+/* Upscale mode: replace Azimuth's bilinear game->window stretch with FSR. Runs right after
+   the display-pass draw (that draw is left intact; its output is overwritten by ours). The
+   output covers the draw's viewport, so pillarboxed aspect ratios are preserved. */
+static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
+    if (!g_upscale || !fsr_enabled() || !scene_depth || !mv_tex || !s->win_bb || !s->num_vp || !disp_w) {
+        return;
+    }
+    /* debug_blink: alternate 30-frame blocks of FSR / the game's own stretch */
+    if (cfg_debug_blink) {
+        static LONG bc;
+        if ((InterlockedIncrement(&bc) / 30) % 2 == 1) {
+            return;
+        }
+    }
+    int st = mv_status();
+    if (st == 0) {
+        return;
+    }
+    int fallback = st < 0;
+    if (fallback && !InterlockedExchange(&fallback_active, 1)) {
+        log_msg("FSR pause/photo fallback active (upscale): zero motion vectors with history reset");
+    } else if (!fallback && InterlockedExchange(&fallback_active, 0)) {
+        log_msg("FSR fresh motion vectors resumed (upscale)");
+    }
+
+    ID3D12Resource *bb = current_game_bb();
+    if (!bb) {
+        return;
+    }
+    D3D12_RESOURCE_DESC bd;
+    bb->lpVtbl->GetDesc(bb, &bd);
+    DXGI_FORMAT color_fmt = bd.Format;
+
+    const ViewEntry *dstv = s->num_rtv ? view_find(s->rtv[0].ptr) : NULL;
+    if (!dstv || !dstv->resource) {
+        ID3D12Resource_Release(bb);
+        return;
+    }
+    ID3D12Resource *dst = dstv->resource;
+    DXGI_FORMAT out_fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : color_fmt;
+
+    /* The display pass's viewport is where the game frame lands on the window back buffer. */
+    UINT out_w = disp_w, out_h = disp_h, dx = 0, dy = 0;
+    if (s->vp[0].Width > 0 && s->vp[0].Height > 0) {
+        out_w = (UINT)s->vp[0].Width;
+        out_h = (UINT)s->vp[0].Height;
+        dx = (UINT)(s->vp[0].TopLeftX > 0 ? s->vp[0].TopLeftX : 0);
+        dy = (UINT)(s->vp[0].TopLeftY > 0 ? s->vp[0].TopLeftY : 0);
+        if (dx + out_w > disp_w) out_w = disp_w - dx;
+        if (dy + out_h > disp_h) out_h = disp_h - dy;
+    }
+    /* Only the frame-stretch draw qualifies: its viewport covers at least the render area. */
+    if ((UINT64)out_w * out_h < (UINT64)rend_w * rend_h) {
+        ID3D12Resource_Release(bb);
+        return;
+    }
+
+    ListState saved = *s;
+    LONG bb_state = game_bb_state, depth_state = scene_depth_state;
+    AcquireSRWLockShared(&mv_lock);
+    if (fallback) {
+        clear_mv(cl);
+    }
+    int ok = fsr_run(cl, bb, (D3D12_RESOURCE_STATES)bb_state, scene_depth, (D3D12_RESOURCE_STATES)depth_state,
+                     mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, out_w, out_h, out_fmt, color_fmt);
+    ID3D12Resource *out = ok ? fsr_output() : NULL;
+    if (ok && out) {
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("first FSR upscale recorded: render %ux%u fmt %d -> %ux%u at +%u+%u fmt %d",
+                    (UINT)bd.Width, (UINT)bd.Height, (int)color_fmt, out_w, out_h, dx, dy, (int)out_fmt);
+        }
+        /* The display-pass draw left the window back buffer in RENDER_TARGET. */
+        transition(cl, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_BOX box = {0, 0, 0, out_w, out_h, 1};
+        D3D12_TEXTURE_COPY_LOCATION dstloc, srcloc;
+        memset(&dstloc, 0, sizeof(dstloc));
+        dstloc.pResource = dst;
+        dstloc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        memset(&srcloc, 0, sizeof(srcloc));
+        srcloc.pResource = out;
+        srcloc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        cl->lpVtbl->CopyTextureRegion(cl, &dstloc, dx, dy, 0, &srcloc, &box);
+        transition(cl, out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(cl, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    ReleaseSRWLockShared(&mv_lock);
+    InterlockedExchange(&game_bb_state, bb_state);
+    InterlockedExchange(&scene_depth_state, depth_state);
+    *s = saved;
+    restore_after_fsr(cl, s);
+    ID3D12Resource_Release(bb);
+    fsr_end_frame((!fallback && ok) ? 1 : 0);
+    static LONG up_count;
+    LONG n = InterlockedIncrement(&up_count);
+    if (ok && (n == 1 || n % 600 == 0)) {
+        log_msg("FSR upscale frame %ld (render %ux%u -> %ux%u at +%u+%u)", n, (UINT)bd.Width, (UINT)bd.Height, out_w,
+                out_h, dx, dy);
+    }
+}
+
+/* Log each distinct PSO that draws into a window back buffer (the display pass), once. */
+static void diag_display_draw(ListState *s) {
+    static ID3D12PipelineState *seen[8];
+    static int seen_n;
+    for (int i = 0; i < seen_n; ++i) {
+        if (seen[i] == s->pso) {
+            return;
+        }
+    }
+    if (seen_n < 8) {
+        seen[seen_n++] = s->pso;
+    }
+    const ViewEntry *c = s->num_rtv ? view_find(s->rtv[0].ptr) : NULL;
+    log_msg("display-pass draw: pso %p vp %.0fx%.0f+%.0f+%.0f rtv %ux%u fmt %d", (void *)s->pso,
+            s->num_vp ? s->vp[0].Width : 0.0f, s->num_vp ? s->vp[0].Height : 0.0f,
+            s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f,
+            c ? c->width : 0, c ? c->height : 0, c ? (int)c->format : -1);
+}
+
+static void setup_upscale_chains(void);
+
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
-    if (s) {
-        redirect_scene_bindings(cl, s);
-    }
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (role == ROLE_RESOLVE && s) {
         BOOL scene_ok = note_scene_resources(s);
         real_DrawInstanced(cl, vc, ic, sv, si);
         count_frame();
-        if (scene_ok) {
+        setup_upscale_chains();
+        if (scene_ok && !g_upscale) {
             run_fsr(cl, s);
         }
         return;
@@ -1290,15 +1121,16 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
         record_mv_pass(cl, s, variant, vc, ic, sv, si);
     }
     real_DrawInstanced(cl, vc, ic, sv, si);
+    if (s && s->win_bb) {
+        diag_display_draw(s);
+        run_upscale(cl, s);
+    }
 }
 
 static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *cl, UINT index_count,
                                                         UINT instance_count, UINT start_index,
                                                         INT base_vertex, UINT start_instance) {
     ListState *s = state_for(cl);
-    if (s) {
-        redirect_scene_bindings(cl, s);
-    }
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (role == ROLE_RESOLVE && s) {
@@ -1308,6 +1140,10 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
         record_mv_pass_indexed(cl, s, variant, index_count, instance_count, start_index, base_vertex, start_instance);
     }
     real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
+    if (s && s->win_bb) {
+        diag_display_draw(s);
+        run_upscale(cl, s);
+    }
 }
 
 /* ---------------------------------------------------------------- device hooks */
@@ -1325,7 +1161,6 @@ static void hook_command_list(ID3D12GraphicsCommandList *cl) {
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetComputeRootSignature), (void *)hook_SetComputeRootSignature, (void **)&real_SetComputeRootSignature);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature), (void *)hook_SetGraphicsRootSignature, (void **)&real_SetGraphicsRootSignature);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootDescriptorTable), (void *)hook_SetGraphicsRootDescriptorTable, (void **)&real_SetGraphicsRootDescriptorTable);
-    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootShaderResourceView), (void *)hook_SetGraphicsRootShaderResourceView, (void **)&real_SetGraphicsRootShaderResourceView);
 }
 
 static HRESULT STDMETHODCALLTYPE hook_CreateCommandList(ID3D12Device *dev, UINT mask, D3D12_COMMAND_LIST_TYPE type,
@@ -1356,8 +1191,6 @@ static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVE
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateCommandList), (void *)hook_CreateCommandList, (void **)&real_CreateCommandList);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateRenderTargetView), (void *)hook_CreateRenderTargetView, (void **)&real_CreateRenderTargetView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateDepthStencilView), (void *)hook_CreateDepthStencilView, (void **)&real_CreateDepthStencilView);
-            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateShaderResourceView), (void *)hook_CreateShaderResourceView, (void **)&real_CreateShaderResourceView);
-            g_srv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             patch_slot(VT_SLOT(dev, ID3D12Device1Vtbl, CreatePipelineLibrary), (void *)hook_CreatePipelineLibrary, (void **)&real_CreatePipelineLibrary);
             fsr_init(dev);
             log_msg("D3D12 device hooked");
@@ -1409,11 +1242,71 @@ static void ensure_hotkey_thread(void) {
     CloseHandle(thread);
 }
 
-/* ---------------------------------------------------------------- swap chain */
+/* ---------------------------------------------------------------- swap chains */
 
-/* No Present/ResizeBuffers hooks here: see the note at count_frame(). The swap chain hook only
-   records the chains (raw pointers, no COM calls in the creation path) and starts the hotkey
-   thread. All chain queries happen later, outside the creation path. */
+/* Keep the game chain at render resolution: Azimuth resizes it to display res so the game
+   stretches into it itself; we want the game back buffer to stay render-sized so Azimuth's
+   game->window display pass does the stretch and we can replace it with FSR. */
+static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers(IDXGISwapChain *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
+    if (g_upscale && rend_w && (UINT64)w * h > (UINT64)rend_w * rend_h) {
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("game chain ResizeBuffers %ux%u clamped to render %ux%u", w, h, rend_w, rend_h);
+        }
+        w = rend_w;
+        h = rend_h;
+    }
+    return real_ResizeBuffers(sc, n, w, h, f, fl);
+}
+
+static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers1(IDXGISwapChain3 *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl,
+                                                     const UINT *mask, IUnknown *const *queues) {
+    if (g_upscale && rend_w && (UINT64)w * h > (UINT64)rend_w * rend_h) {
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("game chain ResizeBuffers1 %ux%u clamped to render %ux%u", w, h, rend_w, rend_h);
+        }
+        w = rend_w;
+        h = rend_h;
+    }
+    return real_ResizeBuffers1(sc, n, w, h, f, fl, mask, queues);
+}
+
+/* Called once both chains exist and the mode is resolved: patch the game chain's
+   ResizeBuffers and snapshot the window chain's back buffers. Runs on a render thread,
+   never inside the factory creation path. */
+static void setup_upscale_chains(void) {
+    static int done;
+    if (done || chain_count < 2 || !chain_obj[0] || !chain_obj[1] || !g_upscale) {
+        return;
+    }
+    done = 1;
+    patch_slot(VT_SLOT(chain_obj[1], IDXGISwapChainVtbl, ResizeBuffers), (void *)hook_ResizeBuffers, (void **)&real_ResizeBuffers);
+    IDXGISwapChain3 *sc3 = NULL;
+    if (SUCCEEDED(IUnknown_QueryInterface(chain_obj[1], &IID_IDXGISwapChain3, (void **)&sc3))) {
+        patch_slot(VT_SLOT(sc3, IDXGISwapChain3Vtbl, ResizeBuffers1), (void *)hook_ResizeBuffers1, (void **)&real_ResizeBuffers1);
+        IDXGISwapChain3_Release(sc3);
+    }
+    UINT n = chain_desc[0].BufferCount;
+    if (n > 8) {
+        n = 8;
+    }
+    for (UINT i = 0; i < n; ++i) {
+        ID3D12Resource *r = NULL;
+        if (SUCCEEDED(IDXGISwapChain_GetBuffer((IDXGISwapChain *)chain_obj[0], i, &IID_ID3D12Resource, (void **)&r)) && r) {
+            window_bb[window_bb_n++] = r; /* raw ref kept; the chain owns the buffers */
+            ID3D12Resource_Release(r);
+        }
+    }
+    log_msg("upscale setup: game chain ResizeBuffers clamped to %ux%u, %u window back buffers cached", rend_w, rend_h,
+            window_bb_n);
+}
+
+/* No Present hooks here (Steam overlay double-hook crash; multiple swap chains in 1.x).
+   The factory hook only records the chains (raw pointers + desc copies, no COM calls in the
+   creation path) and starts the hotkey thread. */
 static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, IUnknown *device, HWND hwnd,
                                                              const DXGI_SWAP_CHAIN_DESC1 *desc,
                                                              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
@@ -1422,7 +1315,8 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
     if (SUCCEEDED(hr) && sc && *sc) {
         ensure_hotkey_thread();
         if (chain_count < 2) {
-            chain_desc[chain_count] = *desc; /* plain struct copy; the chain object itself is never touched */
+            chain_obj[chain_count] = (IUnknown *)*sc;
+            chain_desc[chain_count] = *desc;
             ++chain_count;
         }
         log_msg("swap chain %ux%u format %d buffers %u flags 0x%x hooked (#%d)", desc->Width, desc->Height,
@@ -1433,12 +1327,20 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
             int win = a0 >= a1 ? 0 : 1; /* the bigger one is the display-sized window chain */
             disp_w = chain_desc[win].Width;
             disp_h = chain_desc[win].Height;
+            rend_w = chain_desc[1 - win].Width;
+            rend_h = chain_desc[1 - win].Height;
             if (cfg_hdr < 0) {
-                cfg_hdr = 1; /* the scene colour is always linear HDR (R11G11B10_FLOAT), whatever the display */
+                cfg_hdr = 1; /* the scene buffer is always linear HDR (R11G11B10_FLOAT) */
             }
             fsr_config(cfg_hdr, cfg_sharpness);
-            log_msg("display %ux%u, game chain created at %ux%u; hdr %s (mode resolved at first resolve: upscale if render < display)",
-                    disp_w, disp_h, chain_desc[1 - win].Width, chain_desc[1 - win].Height, cfg_hdr ? "on" : "off");
+            int area_r = (int)(rend_w * rend_h), area_d = (int)(disp_w * disp_h);
+            g_upscale = cfg_mode == 1 ? 0 : (area_r < area_d);
+            if (cfg_mode == 2 && area_r >= area_d) {
+                log_msg("upscale mode requested but render %ux%u >= display %ux%u; using native AA", rend_w, rend_h,
+                        disp_w, disp_h);
+            }
+            log_msg("display %ux%u, game chain created at %ux%u -> mode %s, hdr %s", disp_w, disp_h, rend_w, rend_h,
+                    g_upscale ? "upscale" : "native", cfg_hdr ? "on" : "off");
         }
     }
     return hr;
@@ -1529,9 +1431,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         }
         lstrcpyW(path + n, L"fh2_fsr.log");
         log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        log_msg("FH2 FSR 4 (Azimuth 1.x). F11: FSR on/off. Native AA at render==display, FSR upscaling when Azimuth renders below display res");
+        log_msg("FH2 FSR 4 (Azimuth 1.x). F11: FSR on/off. Native AA at render==display, FSR upscaling when render < display");
 
-        /* Optional fh2_fsr.ini next to the DLL: [fsr] mode=auto|native|upscale hdr=auto|on|off sharpness=0..1 */
+        /* Optional fh2_fsr.ini next to the DLL: [fsr] mode=auto|native|upscale hdr=auto|on|off sharpness debug_blink */
         wchar_t ini[MAX_PATH], v[64];
         lstrcpyW(ini, path);
         lstrcpyW(ini + n, L"fh2_fsr.ini");

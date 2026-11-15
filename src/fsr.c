@@ -234,16 +234,34 @@ static struct FfxApiResource ffx_resource(ID3D12Resource *r, uint32_t format, ui
 
 #define READ_STATE (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
 
+static int to_ffx_format(DXGI_FORMAT f, uint32_t *out) {
+    switch (f) {
+    case DXGI_FORMAT_R11G11B10_FLOAT: *out = FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT; return 1;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: *out = FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM; return 1;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: *out = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM; return 1;
+    default: return 0;
+    }
+}
+
 int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state,
             ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state, ID3D12Resource *motion,
-            D3D12_RESOURCE_STATES motion_state, UINT out_w, UINT out_h) {
+            D3D12_RESOURCE_STATES motion_state, UINT out_w, UINT out_h, DXGI_FORMAT out_fmt,
+            DXGI_FORMAT color_fmt) {
     if (!enabled) {
         return 0;
     }
     D3D12_RESOURCE_DESC cd;
     color->lpVtbl->GetDesc(color, &cd);
     UINT w = (UINT)cd.Width, h = cd.Height;
-    if (!create_context(w, h, out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT)) {
+    if (!create_context(w, h, out_w, out_h, out_fmt)) {
+        return 0;
+    }
+    uint32_t color_f, out_f;
+    if (!to_ffx_format(color_fmt, &color_f) || !to_ffx_format(out_fmt, &out_f)) {
+        static int warned_fmt;
+        if (!warned_fmt++) {
+            log_msg("FSR: unsupported format pair color %d out %d", (int)color_fmt, (int)out_fmt);
+        }
         return 0;
     }
     /* Everything FSR reads goes to the shader-read state it is told about. */
@@ -260,10 +278,10 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
     memset(&d, 0, sizeof(d));
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = cl;
-    d.color = ffx_resource(color, FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.color = ffx_resource(color, color_f, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.depth = ffx_resource(depth, FFX_API_SURFACE_FORMAT_R32_FLOAT, FFX_API_RESOURCE_USAGE_DEPTHTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.motionVectors = ffx_resource(motion, FFX_API_SURFACE_FORMAT_R16G16_FLOAT, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    d.output = ffx_resource(out_tex, FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.output = ffx_resource(out_tex, out_f, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     d.jitterOffset.x = jitter_used ? jx : 0.0f;
     d.jitterOffset.y = jitter_used ? jy : 0.0f;
     /* Our motion vectors are UV-space offsets from current to previous position. */
