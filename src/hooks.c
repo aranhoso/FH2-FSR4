@@ -498,6 +498,9 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
 /* Descriptor copies land in heap slots we never saw created: mirror the view entry src -> dst. */
 static void view_copy_entries(ID3D12Device *dev, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
                               UINT count, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    if (count > 4096) {
+        count = 4096; /* sanity bound */
+    }
     UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, type);
     for (UINT k = 0; k < count; ++k) {
         SIZE_T s = src.ptr + (SIZE_T)k * inc, d = dst.ptr + (SIZE_T)k * inc;
@@ -515,15 +518,19 @@ static void STDMETHODCALLTYPE hook_CopyDescriptors(ID3D12Device *dev, UINT nd, c
                                                    const UINT *dst_sizes, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE *src,
                                                    const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     real_CopyDescriptors(dev, nd, dst, dst_sizes, ns, src, src_sizes, type);
-    UINT di = 0, si = 0;
+    /* dst[]/src[] are per-RANGE start handles; the sizes arrays give each range's descriptor count
+       (NULL means 1). Index them by range, never by accumulated counts. */
     for (UINT r = 0; r < nd && r < ns; ++r) {
-        UINT count = dst_sizes ? dst_sizes[r] : src_sizes[r];
-        if (!count) {
-            count = src_sizes ? src_sizes[r] : 1;
+        UINT count = 1;
+        if (dst_sizes) {
+            count = dst_sizes[r];
+        } else if (src_sizes) {
+            count = src_sizes[r];
         }
-        view_copy_entries(dev, dst[di], src[si], count, type);
-        di += dst_sizes ? dst_sizes[r] : 1;
-        si += src_sizes ? src_sizes[r] : 1;
+        if (!count) {
+            count = 1;
+        }
+        view_copy_entries(dev, dst[r], src[r], count, type);
     }
 }
 
