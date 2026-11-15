@@ -156,6 +156,7 @@ static void(STDMETHODCALLTYPE *real_SetDescriptorHeaps)(ID3D12GraphicsCommandLis
 static void(STDMETHODCALLTYPE *real_SetComputeRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
 static void(STDMETHODCALLTYPE *real_SetGraphicsRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
 static void(STDMETHODCALLTYPE *real_SetGraphicsRootDescriptorTable)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+static void(STDMETHODCALLTYPE *real_SetGraphicsRootShaderResourceView)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateRenderTargetView)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateDepthStencilView)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateShaderResourceView)(ID3D12Device *, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -351,9 +352,14 @@ typedef struct {
     D3D12_RECT sc[4];
     UINT num_heaps;
     ID3D12DescriptorHeap *heaps[2];
+    D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu[2];  /* per bound heap, valid when num_heaps > 0 */
+    D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu[2];
+    UINT heap_num[2];
     ID3D12RootSignature *compute_rs;
     UINT tables_mask;
     D3D12_GPU_DESCRIPTOR_HANDLE tables[32];
+    UINT root_srv_mask;
+    D3D12_GPU_DESCRIPTOR_HANDLE root_srv[32];
 } ListState;
 
 /* Azimuth creates command lists continually and never tells us when one dies, so this
@@ -586,13 +592,52 @@ static void STDMETHODCALLTYPE hook_RSSetScissorRects(ID3D12GraphicsCommandList *
     real_RSSetScissorRects(cl, n, r);
 }
 
+static UINT g_srv_inc;   /* CBV_SRV_UAV descriptor increment, set when the device is hooked */
+
 static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList *cl, UINT n, ID3D12DescriptorHeap *const *h) {
+    real_SetDescriptorHeaps(cl, n, h);
     ListState *s = state_for(cl);
     if (s) {
         s->num_heaps = n > 2 ? 2 : n;
         memcpy(s->heaps, h, s->num_heaps * sizeof(*h));
+        for (UINT i = 0; i < s->num_heaps; ++i) {
+            D3D12_DESCRIPTOR_HEAP_DESC d;
+            s->heaps[i]->lpVtbl->GetDesc(s->heaps[i], &d);
+            s->heap_num[i] = d.NumDescriptors;
+            if (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+                s->heaps[i]->lpVtbl->GetCPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_cpu[i]);
+                s->heaps[i]->lpVtbl->GetGPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_gpu[i]);
+            } else {
+                s->heap_gpu[i].ptr = 0;
+                s->heap_cpu[i].ptr = 0;
+                s->heap_num[i] = 0;
+            }
+        }
     }
-    real_SetDescriptorHeaps(cl, n, h);
+}
+
+/* GPU handle -> CPU handle for the currently bound shader-visible heaps. 0 when unknown. */
+static SIZE_T gpu_to_cpu(ListState *s, D3D12_GPU_DESCRIPTOR_HANDLE g) {
+    for (UINT i = 0; i < s->num_heaps; ++i) {
+        if (!s->heap_gpu[i].ptr || !g_srv_inc) {
+            continue;
+        }
+        UINT64 base = s->heap_gpu[i].ptr, span = (UINT64)s->heap_num[i] * g_srv_inc;
+        if (g.ptr >= base && g.ptr < base + span) {
+            return s->heap_cpu[i].ptr + (g.ptr - base);
+        }
+    }
+    return 0;
+}
+
+static void STDMETHODCALLTYPE hook_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList *cl, UINT index,
+                                                                    D3D12_GPU_DESCRIPTOR_HANDLE h) {
+    ListState *s = state_for(cl);
+    if (s && index < 32) {
+        s->root_srv[index] = h;
+        s->root_srv_mask |= 1u << index;
+    }
+    real_SetGraphicsRootShaderResourceView(cl, index, h);
 }
 
 static void STDMETHODCALLTYPE hook_SetComputeRootSignature(ID3D12GraphicsCommandList *cl, ID3D12RootSignature *rs) {
@@ -607,6 +652,7 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootSignature(ID3D12GraphicsComman
     ListState *s = state_for(cl);
     if (s) {
         s->tables_mask = 0;
+        s->root_srv_mask = 0;
     }
     real_SetGraphicsRootSignature(cl, rs);
 }
@@ -677,8 +723,10 @@ static D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle(ID3D12DescriptorHeap *heap, UINT i
     return h;
 }
 
+static ID3D12DescriptorHeap *srv_heap;   /* shader visible, slot 0: FSR output SRV for root-SRV rebinding */
+
 static int ensure_heaps(void) {
-    if (rtv_heap) {
+    if (rtv_heap && srv_heap) {
         return 1;
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd;
@@ -689,6 +737,12 @@ static int ensure_heaps(void) {
         return 0;
     }
     rtv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(g_device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 8;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(g_device, &hd, &IID_ID3D12DescriptorHeap, (void **)&srv_heap))) {
+        return 0;
+    }
     return 1;
 }
 
@@ -893,33 +947,134 @@ static void clear_mv(ID3D12GraphicsCommandList *cl) {
     transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-/* In upscale mode, point every SRV descriptor that references the scene colour at the FSR output
-   texture, so the game's post-resolve passes (tonemap/present into the display-sized back
-   buffer, HUD) sample the upscaled HDR image. The FSR output is never released by fsr.c, so
-   the descriptors can never dangle. */
+/* In upscale mode, the game's scene-colour bindings must sample the FSR output instead of the
+   render-sized scene colour. Two binding styles are covered:
+   - descriptor tables: the SRV descriptors that reference the scene colour are overwritten with
+     an SRV of the FSR output (handles cached per frame, re-applied before every draw because the
+     game rewrites its heaps per pass, which would otherwise clobber a resolve-time overwrite);
+   - root SRVs: the root parameter is rebound to our own heap slot holding the output SRV.
+   The FSR output is never released by fsr.c, so descriptors can never dangle. */
+static ID3D12Resource *volatile g_upscale_tex;
+static D3D12_GPU_DESCRIPTOR_HANDLE g_up_gpu;
+static SIZE_T scene_srv[16];
+static int scene_srv_n;
+static int cfg_debug_blink;
+
+static void overwrite_srv(ID3D12Resource *up, SIZE_T cpu_handle) {
+    const ViewEntry *e = view_find(cpu_handle);
+    if (!e || e->kind != 3 || e->resource != scene_color || !g_device) {
+        return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
+    if (d.Format == DXGI_FORMAT_UNKNOWN) {
+        D3D12_RESOURCE_DESC ud;
+        up->lpVtbl->GetDesc(up, &ud);
+        d.Format = ud.Format;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    h.ptr = cpu_handle;
+    ID3D12Device_CreateShaderResourceView(g_device, up, &d, h);
+}
+
+/* Collect the scene colour's SRV handles and point them at the FSR output. Called at the resolve. */
 static void redirect_scene_srv(ID3D12Resource *up) {
     if (!up || !scene_color || !g_device) {
         return;
     }
-    D3D12_RESOURCE_DESC ud;
-    up->lpVtbl->GetDesc(up, &ud);
+    scene_srv_n = 0;
     int n = 0;
     for (UINT i = 0; i < MAX_VIEWS; ++i) {
         ViewEntry *e = &views[i];
         if (e->handle && e->kind == 3 && e->resource == scene_color) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
-            if (d.Format == DXGI_FORMAT_UNKNOWN) {
-                d.Format = ud.Format;
+            if (scene_srv_n < 16) {
+                scene_srv[scene_srv_n++] = e->handle;
             }
-            D3D12_CPU_DESCRIPTOR_HANDLE h;
-            h.ptr = e->handle;
-            ID3D12Device_CreateShaderResourceView(g_device, up, &d, h);
+            overwrite_srv(up, e->handle);
             ++n;
         }
     }
+    if (ensure_heaps()) {
+        D3D12_CPU_DESCRIPTOR_HANDLE c = cpu_handle(srv_heap, 0, g_srv_inc);
+        ID3D12Device_CreateShaderResourceView(g_device, up, NULL, c);
+        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
+    }
+    g_upscale_tex = up;
     static LONG redirected;
     if (n && (InterlockedIncrement(&redirected) == 1 || redirected % 600 == 0)) {
         log_msg("scene colour SRVs redirected to the FSR output (%d handle(s), frame %ld)", n, redirected);
+    }
+}
+
+/* Point the cached scene-colour SRV handles back at the scene colour (debug blink off-frames). */
+static void restore_scene_srv(void) {
+    if (!scene_color || !g_device) {
+        return;
+    }
+    for (int i = 0; i < scene_srv_n; ++i) {
+        const ViewEntry *e = view_find(scene_srv[i]);
+        if (e && e->kind == 3 && e->handle) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
+            if (d.Format == DXGI_FORMAT_UNKNOWN) {
+                D3D12_RESOURCE_DESC rd;
+                scene_color->lpVtbl->GetDesc(scene_color, &rd);
+                d.Format = rd.Format;
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE h;
+            h.ptr = scene_srv[i];
+            ID3D12Device_CreateShaderResourceView(g_device, scene_color, &d, h);
+        }
+    }
+}
+
+/* Re-apply the redirect before a draw: the game may have rewritten descriptors or re-set root
+   SRVs since the resolve. Also reports (once per PSO) whether a draw into a display-sized
+   target binds the scene colour at all. */
+static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s) {
+    ID3D12Resource *up = g_upscale_tex;
+    if (!g_upscale || !up || !scene_color) {
+        return;
+    }
+    for (int i = 0; i < scene_srv_n; ++i) {
+        overwrite_srv(up, scene_srv[i]);
+    }
+    int bound_scene = 0;
+    for (UINT i = 0; i < 32; ++i) {
+        if (s->root_srv_mask & (1u << i)) {
+            SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i]);
+            const ViewEntry *e = cpu ? view_find(cpu) : NULL;
+            if (e && e->kind == 3 && e->resource == scene_color) {
+                real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
+                ++bound_scene;
+            }
+        }
+        if (s->tables_mask & (1u << i)) {
+            SIZE_T cpu = gpu_to_cpu(s, s->tables[i]);
+            const ViewEntry *e = cpu ? view_find(cpu) : NULL;
+            if (e && e->kind == 3 && e->resource == scene_color) {
+                overwrite_srv(up, cpu);
+                ++bound_scene;
+            }
+        }
+    }
+    /* diagnostic: does a draw into a display-sized target sample the scene colour? */
+    if (s->num_rtv && disp_w) {
+        const ViewEntry *c = view_find(s->rtv[0].ptr);
+        if (c && c->resource && c->width == disp_w && c->height == disp_h) {
+            static ID3D12PipelineState *seen[8];
+            static int seen_n;
+            int i;
+            for (i = 0; i < seen_n; ++i) {
+                if (seen[i] == s->pso) {
+                    return;
+                }
+            }
+            if (seen_n < 8) {
+                seen[seen_n++] = s->pso;
+            }
+            log_msg("display-target draw: pso %p vp %.0fx%.0f+%.0f+%.0f scene bindings %d", (void *)s->pso,
+                    s->num_vp ? s->vp[0].Width : 0.0f, s->num_vp ? s->vp[0].Height : 0.0f,
+                    s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f, bound_scene);
+        }
     }
 }
 
@@ -986,9 +1141,20 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                      out_w, out_h);
     ID3D12Resource *out = ok ? fsr_output() : NULL;
+    static LONG fsr_frames;
+    LONG n = InterlockedIncrement(&fsr_frames);
     if (ok && out) {
         if (g_upscale) {
-            redirect_scene_srv(out);
+            /* debug_blink: alternate 30 frames FSR / 30 frames original, so the effect is visible */
+            if (cfg_debug_blink && (n / 30) % 2 == 1) {
+                g_upscale_tex = NULL;
+                restore_scene_srv();
+                if (n % 30 == 1) {
+                    log_msg("debug blink: showing the game's own stretch (frame %ld)", n);
+                }
+            } else {
+                redirect_scene_srv(out);
+            }
         } else {
             transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1006,8 +1172,6 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
        frames deliberately remain disconnected from history: fsr_end_frame(0) keeps reset
        asserted and suppresses camera jitter until fresh MVs return. */
     fsr_end_frame((!fallback && ok) ? 1 : 0);
-    static LONG fsr_frames;
-    LONG n = InterlockedIncrement(&fsr_frames);
     if (ok && (n == 1 || n % 600 == 0)) {
         log_msg("FSR frame %ld (%s, render %ux%u -> out %ux%u)", n, g_upscale ? "upscale" : "native", w, h, out_w, out_h);
     }
@@ -1015,6 +1179,9 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
 
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
+    if (s) {
+        redirect_scene_bindings(cl, s);
+    }
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (role == ROLE_RESOLVE && s) {
@@ -1035,6 +1202,9 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
                                                         UINT instance_count, UINT start_index,
                                                         INT base_vertex, UINT start_instance) {
     ListState *s = state_for(cl);
+    if (s) {
+        redirect_scene_bindings(cl, s);
+    }
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (role == ROLE_RESOLVE && s) {
@@ -1061,6 +1231,7 @@ static void hook_command_list(ID3D12GraphicsCommandList *cl) {
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetComputeRootSignature), (void *)hook_SetComputeRootSignature, (void **)&real_SetComputeRootSignature);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature), (void *)hook_SetGraphicsRootSignature, (void **)&real_SetGraphicsRootSignature);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootDescriptorTable), (void *)hook_SetGraphicsRootDescriptorTable, (void **)&real_SetGraphicsRootDescriptorTable);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootShaderResourceView), (void *)hook_SetGraphicsRootShaderResourceView, (void **)&real_SetGraphicsRootShaderResourceView);
 }
 
 static HRESULT STDMETHODCALLTYPE hook_CreateCommandList(ID3D12Device *dev, UINT mask, D3D12_COMMAND_LIST_TYPE type,
@@ -1092,6 +1263,7 @@ static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVE
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateRenderTargetView), (void *)hook_CreateRenderTargetView, (void **)&real_CreateRenderTargetView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateDepthStencilView), (void *)hook_CreateDepthStencilView, (void **)&real_CreateDepthStencilView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateShaderResourceView), (void *)hook_CreateShaderResourceView, (void **)&real_CreateShaderResourceView);
+            g_srv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             patch_slot(VT_SLOT(dev, ID3D12Device1Vtbl, CreatePipelineLibrary), (void *)hook_CreatePipelineLibrary, (void **)&real_CreatePipelineLibrary);
             fsr_init(dev);
             log_msg("D3D12 device hooked");
@@ -1275,8 +1447,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         cfg_hdr = !lstrcmpiW(v, L"on") ? 1 : (!lstrcmpiW(v, L"off") ? 0 : -1);
         GetPrivateProfileStringW(L"fsr", L"sharpness", L"-1", v, 64, ini);
         cfg_sharpness = (float)_wtof(v);
+        GetPrivateProfileStringW(L"fsr", L"debug_blink", L"0", v, 64, ini);
+        cfg_debug_blink = _wtoi(v);
         fsr_config(cfg_hdr >= 0 ? cfg_hdr : 1, cfg_sharpness);
-        log_msg("config: mode=%d hdr=%d sharpness=%.2f", cfg_mode, cfg_hdr, cfg_sharpness);
+        log_msg("config: mode=%d hdr=%d sharpness=%.2f debug_blink=%d", cfg_mode, cfg_hdr, cfg_sharpness, cfg_debug_blink);
 
         log_msg(patch_exe_import() ? "D3D12CreateDevice import patched" : "D3D12CreateDevice import NOT found");
     }

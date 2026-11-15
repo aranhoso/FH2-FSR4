@@ -55,6 +55,7 @@ Optional `fh2_fsr.ini` next to the DLLs:
 mode=auto        ; auto | native | upscale
 hdr=auto         ; auto | on | off  (FSR HDR flag on the scene input; auto = on)
 sharpness=-1     ; -1 = off, 0..1 = FSR sharpening strength (1 = max)
+debug_blink=0    ; 1 = alternate 30 frames FSR / 30 frames the game's own stretch (visibility test)
 ```
 
 Motion vectors, depth and camera jitter are taken from the game's own passes at render resolution, so they scale automatically with the render size.
