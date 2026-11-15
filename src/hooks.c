@@ -160,10 +160,8 @@ static void(STDMETHODCALLTYPE *real_SetGraphicsRootShaderResourceView)(ID3D12Gra
 static void(STDMETHODCALLTYPE *real_CreateRenderTargetView)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateDepthStencilView)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateShaderResourceView)(ID3D12Device *, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
-static void(STDMETHODCALLTYPE *real_CopyDescriptors)(ID3D12Device *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *,
-                                                   UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *, D3D12_DESCRIPTOR_HEAP_TYPE);
-static void(STDMETHODCALLTYPE *real_CopyDescriptorsSimple)(ID3D12Device *, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
-                                                           D3D12_DESCRIPTOR_HEAP_TYPE);
+/* NOTE: CopyDescriptors/CopyDescriptorsSimple are deliberately NOT hooked: AMD's amdxc64 shim
+   hooks the same device vtable slots, and double-patching made it crash at startup (index -1). */
 static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
@@ -495,50 +493,7 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
     view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 3, desc);
 }
 
-/* Descriptor copies land in heap slots we never saw created: mirror the view entry src -> dst. */
-static void view_copy_entries(ID3D12Device *dev, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
-                              UINT count, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    if (count > 4096) {
-        count = 4096; /* sanity bound */
-    }
-    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, type);
-    for (UINT k = 0; k < count; ++k) {
-        SIZE_T s = src.ptr + (SIZE_T)k * inc, d = dst.ptr + (SIZE_T)k * inc;
-        const ViewEntry *e = view_find(s);
-        if (e && e->handle) {
-            ViewEntry copy = *e;
-            copy.handle = d;
-            /* write through the map: reuse view_record with the saved fields */
-            view_record((D3D12_CPU_DESCRIPTOR_HANDLE){d}, copy.resource, copy.format, copy.kind, &copy.srv_desc);
-        }
-    }
-}
 
-static void STDMETHODCALLTYPE hook_CopyDescriptors(ID3D12Device *dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE *dst,
-                                                   const UINT *dst_sizes, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE *src,
-                                                   const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    real_CopyDescriptors(dev, nd, dst, dst_sizes, ns, src, src_sizes, type);
-    /* dst[]/src[] are per-RANGE start handles; the sizes arrays give each range's descriptor count
-       (NULL means 1). Index them by range, never by accumulated counts. */
-    for (UINT r = 0; r < nd && r < ns; ++r) {
-        UINT count = 1;
-        if (dst_sizes) {
-            count = dst_sizes[r];
-        } else if (src_sizes) {
-            count = src_sizes[r];
-        }
-        if (!count) {
-            count = 1;
-        }
-        view_copy_entries(dev, dst[r], src[r], count, type);
-    }
-}
-
-static void STDMETHODCALLTYPE hook_CopyDescriptorsSimple(ID3D12Device *dev, D3D12_CPU_DESCRIPTOR_HANDLE dst,
-                                                         D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
-    real_CopyDescriptorsSimple(dev, dst, src, type);
-    view_copy_entries(dev, dst, src, 1, type);
-}
 
 /* The scene depth buffer: depth+stencil at the scene colour's size (found at the resolve). */
 static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
@@ -1339,8 +1294,6 @@ static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVE
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateRenderTargetView), (void *)hook_CreateRenderTargetView, (void **)&real_CreateRenderTargetView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateDepthStencilView), (void *)hook_CreateDepthStencilView, (void **)&real_CreateDepthStencilView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateShaderResourceView), (void *)hook_CreateShaderResourceView, (void **)&real_CreateShaderResourceView);
-            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CopyDescriptors), (void *)hook_CopyDescriptors, (void **)&real_CopyDescriptors);
-            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CopyDescriptorsSimple), (void *)hook_CopyDescriptorsSimple, (void **)&real_CopyDescriptorsSimple);
             g_srv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             patch_slot(VT_SLOT(dev, ID3D12Device1Vtbl, CreatePipelineLibrary), (void *)hook_CreatePipelineLibrary, (void **)&real_CreatePipelineLibrary);
             fsr_init(dev);
