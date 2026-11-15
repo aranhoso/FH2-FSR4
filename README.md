@@ -1,8 +1,8 @@
 # FH2-FSR4
 
-**AMD FSR 4 Native AA (FSR Upscaling 4.1.1) for Forza Horizon 2 running on [Azimuth](https://almost-there-games.itch.io/azimuth).**
+**AMD FSR 4 (FSR Upscaling 4.1.1) for Forza Horizon 2 running on [Azimuth](https://almost-there-games.itch.io/azimuth).**
 
-This mod replaces the game's MSAA with FSR 4's temporal anti-aliasing at native resolution (no upscaling). The result is no jaggies, stable fences, wires and foliage, and a much cleaner image in motion.
+This mod replaces the game's MSAA with FSR 4's temporal anti-aliasing. At native resolution it is Native AA (no upscaling); when Azimuth renders below the display resolution (`resolution=` in `data\azimuth.ini`), the mod replaces Azimuth's final bilinear stretch with FSR upscaling to the display resolution. The result is no jaggies, stable fences, wires and foliage, and a much cleaner image in motion.
 
 It is an unofficial mod, not affiliated with AMD, Microsoft, Playground Games or Almost There Games.
 
@@ -39,6 +39,26 @@ It works alongside [FH2 Extra Options](https://github.com/RokkuDayo/ForzaHorizon
 
 The key is polled from a dedicated thread, so F11 works even when the game is launched from Steam.
 
+## FSR upscaling
+
+Azimuth 1.x renders the game into a render-resolution swap chain (`resolution=` / `aspect=` in `data\azimuth.ini`) and stretches the frame onto the display-resolution window chain with a bilinear draw. When the render size is smaller than the display size, this mod replaces that stretch with FSR 4 upscaling:
+
+1. Set e.g. `resolution=1080` with `aspect=21:9` in `data\azimuth.ini` on a 3440x1440 display (keep `antialiasing=off`).
+2. Launch as usual. `fh2_fsr.log` reports `mode upscale` and `first FSR upscale recorded: render 2580x1080 -> ...`.
+
+When render size == display size, the mod automatically stays in Native AA mode.
+
+Optional `fh2_fsr.ini` next to the DLLs:
+
+```ini
+[fsr]
+mode=auto        ; auto | native | upscale
+hdr=auto         ; auto | on | off  (FSR HDR flag; auto = on for R10G10B10A2 back buffers)
+sharpness=-1     ; -1 = off, 0..1 = FSR sharpening strength (1 = max)
+```
+
+In upscale mode the HUD is part of the upscaled frame. Motion vectors, depth and camera jitter are taken from the game's own passes at render resolution, so they scale automatically.
+
 The log is written to `fh2_fsr.log` in the Azimuth folder.
 
 ## How it works
@@ -48,7 +68,7 @@ FH2 never had TAA, and FSR needs four things the game doesn't provide out of the
 - **Sub-pixel jitter:** offsets the viewport of the scene passes, only while the scene depth buffer is bound, following FSR's official jitter sequence.
 - **Full-resolution motion vectors:** FH2's motion blur already computes the reprojection of the camera and of each car (the matrix is picked by each object's stencil value), but at half resolution and with a clamped vector. The mod runs a variant of that shader at full resolution, without the clamp, using the game's own bindings.
 - **HDR colour and depth:** the mod takes the targets of the scene resolve, before tonemapping and the HUD.
-- **FSR dispatch:** FSR runs inside the game's own command list, right after the scene resolve. Its output is copied back into the scene colour, and the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
+- **FSR dispatch:** in Native AA mode, FSR runs inside the game's own command list right after the scene resolve, and its output is copied back into the scene colour. In upscale mode, FSR runs on Azimuth's display pass (the game->window frame transfer) and its output is copied into the window back buffer over the draw's viewport. Either way the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
 
 The game's passes are identified by the DXBC checksums of their pixel shaders (the Azimuth 1.x builds), and the resolve is also validated by its render-target formats (R11G11B10 colour + D32 depth).
 
