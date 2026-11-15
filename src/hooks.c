@@ -106,8 +106,27 @@ typedef struct {
     DXGI_FORMAT format;   /* view format, or resource format when the view had no desc */
     UINT width, height;
     UINT8 kind;           /* 0 none, 1 RTV, 2 DSV, 3 SRV */
+    SIZE_T heap_cpu;      /* cpu base of the heap this handle belongs to (0 = unknown) */
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;  /* saved desc when kind == 3 */
 } ViewEntry;
+
+/* Live shader-visible heaps (cpu base + span), refreshed on SetDescriptorHeaps. Handles are
+   only unique per heap, so view entries are tagged with their heap to avoid cross-heap
+   collisions when resolving gpu handles back to cpu handles. */
+static struct {
+    SIZE_T cpu;
+    UINT64 span;
+} live_heaps[16];
+static int live_heaps_n;
+
+static SIZE_T live_heap_of(SIZE_T handle) {
+    for (int i = 0; i < live_heaps_n; ++i) {
+        if (handle >= live_heaps[i].cpu && handle < live_heaps[i].cpu + live_heaps[i].span) {
+            return live_heaps[i].cpu;
+        }
+    }
+    return 0;
+}
 #define MAX_VIEWS 65536
 static ViewEntry views[MAX_VIEWS];
 static UINT scene_w, scene_h;   /* render size, from the scene colour at the resolve */
@@ -447,6 +466,7 @@ static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI
     e->resource = res;
     e->handle = h.ptr;
     e->kind = kind;
+    e->heap_cpu = live_heap_of(h.ptr);
     if (kind == 3) {
         if (srv_desc) {
             e->srv_desc = *srv_desc;
@@ -612,6 +632,21 @@ static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList 
             if (d.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
                 s->heaps[i]->lpVtbl->GetCPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_cpu[i]);
                 s->heaps[i]->lpVtbl->GetGPUDescriptorHandleForHeapStart(s->heaps[i], &s->heap_gpu[i]);
+                UINT inc = g_srv_inc ? g_srv_inc : 32;
+                SIZE_T cpu = s->heap_cpu[i].ptr;
+                UINT64 span = (UINT64)d.NumDescriptors * inc;
+                int found = 0;
+                for (int k = 0; k < live_heaps_n; ++k) {
+                    if (live_heaps[k].cpu == cpu) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found && live_heaps_n < 16) {
+                    live_heaps[live_heaps_n].cpu = cpu;
+                    live_heaps[live_heaps_n].span = span;
+                    ++live_heaps_n;
+                }
             } else {
                 s->heap_gpu[i].ptr = 0;
                 s->heap_cpu[i].ptr = 0;
@@ -621,18 +656,32 @@ static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList 
     }
 }
 
-/* GPU handle -> CPU handle for the currently bound shader-visible heaps. 0 when unknown. */
-static SIZE_T gpu_to_cpu(ListState *s, D3D12_GPU_DESCRIPTOR_HANDLE g) {
+/* GPU handle -> CPU handle for the currently bound shader-visible heaps. 0 when unknown.
+   *heap_cpu_out (optional) receives the owning heap's cpu base for heap-tag verification. */
+static SIZE_T gpu_to_cpu(ListState *s, D3D12_GPU_DESCRIPTOR_HANDLE g, SIZE_T *heap_cpu_out) {
     for (UINT i = 0; i < s->num_heaps; ++i) {
         if (!s->heap_gpu[i].ptr || !g_srv_inc) {
             continue;
         }
         UINT64 base = s->heap_gpu[i].ptr, span = (UINT64)s->heap_num[i] * g_srv_inc;
         if (g.ptr >= base && g.ptr < base + span) {
+            if (heap_cpu_out) {
+                *heap_cpu_out = s->heap_cpu[i].ptr;
+            }
             return s->heap_cpu[i].ptr + (g.ptr - base);
         }
     }
     return 0;
+}
+
+/* A view entry is trustworthy for a handle resolved through heap with base heap_cpu when the
+   entry was recorded in that same heap (or its heap is unknown). */
+static const ViewEntry *view_find_heap(SIZE_T handle, SIZE_T heap_cpu) {
+    const ViewEntry *e = view_find(handle);
+    if (e && e->handle && (e->heap_cpu == 0 || e->heap_cpu == heap_cpu)) {
+        return e;
+    }
+    return NULL;
 }
 
 static void STDMETHODCALLTYPE hook_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList *cl, UINT index,
@@ -1054,19 +1103,21 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
     int bound_scene = 0;
     for (UINT i = 0; i < 32; ++i) {
         if (s->root_srv_mask & (1u << i)) {
-            SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i]);
-            const ViewEntry *e = cpu ? view_find(cpu) : NULL;
+            SIZE_T heap_cpu = 0;
+            SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i], &heap_cpu);
+            const ViewEntry *e = cpu ? view_find_heap(cpu, heap_cpu) : NULL;
             if (is_scene_srv(e)) {
                 real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
                 ++bound_scene;
             }
         }
         if (s->tables_mask & (1u << i)) {
-            SIZE_T base = gpu_to_cpu(s, s->tables[i]);
+            SIZE_T heap_cpu = 0;
+            SIZE_T base = gpu_to_cpu(s, s->tables[i], &heap_cpu);
             if (base && g_srv_inc) {
                 /* a table is a contiguous descriptor range; scan it for the scene */
                 for (UINT k = 0; k < 64; ++k) {
-                    const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
+                    const ViewEntry *e = view_find_heap(base + (SIZE_T)k * g_srv_inc, heap_cpu);
                     if (!e || !e->handle) {
                         break;
                     }
@@ -1101,13 +1152,14 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
                     continue;
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE g = (s->tables_mask & (1u << t)) ? s->tables[t] : s->root_srv[t];
-                SIZE_T base = gpu_to_cpu(s, g);
+                SIZE_T heap_cpu = 0;
+                SIZE_T base = gpu_to_cpu(s, g, &heap_cpu);
                 if (!base || !g_srv_inc) {
                     log_msg("  binding %u: gpu %llx not resolvable (heaps %u)", t, (unsigned long long)g.ptr, s->num_heaps);
                     continue;
                 }
                 for (UINT k = 0; k < 16; ++k) {
-                    const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
+                    const ViewEntry *e = view_find_heap(base + (SIZE_T)k * g_srv_inc, heap_cpu);
                     if (!e || !e->handle) {
                         log_msg("  binding %u[%u]: ?", t, k);
                         continue;
