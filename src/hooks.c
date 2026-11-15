@@ -160,6 +160,10 @@ static void(STDMETHODCALLTYPE *real_SetGraphicsRootShaderResourceView)(ID3D12Gra
 static void(STDMETHODCALLTYPE *real_CreateRenderTargetView)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateDepthStencilView)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
 static void(STDMETHODCALLTYPE *real_CreateShaderResourceView)(ID3D12Device *, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
+static void(STDMETHODCALLTYPE *real_CopyDescriptors)(ID3D12Device *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *,
+                                                   UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, const UINT *, D3D12_DESCRIPTOR_HEAP_TYPE);
+static void(STDMETHODCALLTYPE *real_CopyDescriptorsSimple)(ID3D12Device *, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                                           D3D12_DESCRIPTOR_HEAP_TYPE);
 static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
@@ -351,10 +355,10 @@ typedef struct {
     D3D12_VIEWPORT vp[4]; /* as the game set them (unjittered) */
     D3D12_RECT sc[4];
     UINT num_heaps;
-    ID3D12DescriptorHeap *heaps[2];
-    D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu[2];  /* per bound heap, valid when num_heaps > 0 */
-    D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu[2];
-    UINT heap_num[2];
+    ID3D12DescriptorHeap *heaps[4];
+    D3D12_CPU_DESCRIPTOR_HANDLE heap_cpu[4];  /* per bound heap, valid when num_heaps > 0 */
+    D3D12_GPU_DESCRIPTOR_HANDLE heap_gpu[4];
+    UINT heap_num[4];
     ID3D12RootSignature *compute_rs;
     UINT tables_mask;
     D3D12_GPU_DESCRIPTOR_HANDLE tables[32];
@@ -491,6 +495,44 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
     view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN, 3, desc);
 }
 
+/* Descriptor copies land in heap slots we never saw created: mirror the view entry src -> dst. */
+static void view_copy_entries(ID3D12Device *dev, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src,
+                              UINT count, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, type);
+    for (UINT k = 0; k < count; ++k) {
+        SIZE_T s = src.ptr + (SIZE_T)k * inc, d = dst.ptr + (SIZE_T)k * inc;
+        const ViewEntry *e = view_find(s);
+        if (e && e->handle) {
+            ViewEntry copy = *e;
+            copy.handle = d;
+            /* write through the map: reuse view_record with the saved fields */
+            view_record((D3D12_CPU_DESCRIPTOR_HANDLE){d}, copy.resource, copy.format, copy.kind, &copy.srv_desc);
+        }
+    }
+}
+
+static void STDMETHODCALLTYPE hook_CopyDescriptors(ID3D12Device *dev, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE *dst,
+                                                   const UINT *dst_sizes, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE *src,
+                                                   const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    real_CopyDescriptors(dev, nd, dst, dst_sizes, ns, src, src_sizes, type);
+    UINT di = 0, si = 0;
+    for (UINT r = 0; r < nd && r < ns; ++r) {
+        UINT count = dst_sizes ? dst_sizes[r] : src_sizes[r];
+        if (!count) {
+            count = src_sizes ? src_sizes[r] : 1;
+        }
+        view_copy_entries(dev, dst[di], src[si], count, type);
+        di += dst_sizes ? dst_sizes[r] : 1;
+        si += src_sizes ? src_sizes[r] : 1;
+    }
+}
+
+static void STDMETHODCALLTYPE hook_CopyDescriptorsSimple(ID3D12Device *dev, D3D12_CPU_DESCRIPTOR_HANDLE dst,
+                                                         D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    real_CopyDescriptorsSimple(dev, dst, src, type);
+    view_copy_entries(dev, dst, src, 1, type);
+}
+
 /* The scene depth buffer: depth+stencil at the scene colour's size (found at the resolve). */
 static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
     const ViewEntry *e = view_find(h.ptr);
@@ -598,7 +640,7 @@ static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList 
     real_SetDescriptorHeaps(cl, n, h);
     ListState *s = state_for(cl);
     if (s) {
-        s->num_heaps = n > 2 ? 2 : n;
+        s->num_heaps = n > 4 ? 4 : n;
         memcpy(s->heaps, h, s->num_heaps * sizeof(*h));
         for (UINT i = 0; i < s->num_heaps; ++i) {
             D3D12_DESCRIPTOR_HEAP_DESC d;
@@ -1048,15 +1090,23 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
             }
         }
         if (s->tables_mask & (1u << i)) {
-            SIZE_T cpu = gpu_to_cpu(s, s->tables[i]);
-            const ViewEntry *e = cpu ? view_find(cpu) : NULL;
-            if (e && e->kind == 3 && e->resource == scene_color) {
-                overwrite_srv(up, cpu);
-                ++bound_scene;
+            SIZE_T base = gpu_to_cpu(s, s->tables[i]);
+            if (base && g_srv_inc) {
+                /* a table is a contiguous descriptor range; scan it for the scene colour */
+                for (UINT k = 0; k < 64; ++k) {
+                    const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
+                    if (!e || !e->handle) {
+                        break;
+                    }
+                    if (e->kind == 3 && e->resource == scene_color) {
+                        overwrite_srv(up, base + (SIZE_T)k * g_srv_inc);
+                        ++bound_scene;
+                    }
+                }
             }
         }
     }
-    /* diagnostic: does a draw into a display-sized target sample the scene colour? */
+    /* diagnostic: what does a draw into a display-sized target actually sample? */
     if (s->num_rtv && disp_w) {
         const ViewEntry *c = view_find(s->rtv[0].ptr);
         if (c && c->resource && c->width == disp_w && c->height == disp_h) {
@@ -1071,9 +1121,28 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
             if (seen_n < 8) {
                 seen[seen_n++] = s->pso;
             }
-            log_msg("display-target draw: pso %p vp %.0fx%.0f+%.0f+%.0f scene bindings %d", (void *)s->pso,
+            log_msg("display-target draw: pso %p vp %.0fx%.0f+%.0f+%.0f scene bindings %d heaps %u", (void *)s->pso,
                     s->num_vp ? s->vp[0].Width : 0.0f, s->num_vp ? s->vp[0].Height : 0.0f,
-                    s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f, bound_scene);
+                    s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f, bound_scene, s->num_heaps);
+            for (UINT t = 0; t < 32; ++t) {
+                if (!(s->tables_mask & (1u << t)) && !(s->root_srv_mask & (1u << t))) {
+                    continue;
+                }
+                D3D12_GPU_DESCRIPTOR_HANDLE g = (s->tables_mask & (1u << t)) ? s->tables[t] : s->root_srv[t];
+                SIZE_T base = gpu_to_cpu(s, g);
+                if (!base || !g_srv_inc) {
+                    log_msg("  binding %u: gpu %llx not resolvable (heaps %u)", t, (unsigned long long)g.ptr, s->num_heaps);
+                    continue;
+                }
+                for (UINT k = 0; k < 16; ++k) {
+                    const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
+                    if (!e || !e->handle) {
+                        break;
+                    }
+                    log_msg("  binding %u[%u]: res %p %ux%u fmt %d kind %u%s", t, k, (void *)e->resource, e->width,
+                            e->height, (int)e->format, e->kind, e->resource == scene_color ? " <== scene" : "");
+                }
+            }
         }
     }
 }
@@ -1263,6 +1332,8 @@ static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVE
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateRenderTargetView), (void *)hook_CreateRenderTargetView, (void **)&real_CreateRenderTargetView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateDepthStencilView), (void *)hook_CreateDepthStencilView, (void **)&real_CreateDepthStencilView);
             patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateShaderResourceView), (void *)hook_CreateShaderResourceView, (void **)&real_CreateShaderResourceView);
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CopyDescriptors), (void *)hook_CopyDescriptors, (void **)&real_CopyDescriptors);
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CopyDescriptorsSimple), (void *)hook_CopyDescriptorsSimple, (void **)&real_CopyDescriptorsSimple);
             g_srv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             patch_slot(VT_SLOT(dev, ID3D12Device1Vtbl, CreatePipelineLibrary), (void *)hook_CreatePipelineLibrary, (void **)&real_CreatePipelineLibrary);
             fsr_init(dev);
