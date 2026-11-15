@@ -11,13 +11,11 @@ INSTALLATION
 
 KEYS
   F11  toggle FSR on/off
-  F9   motion-vector debug overlay
-  F10  overlay scale
 
 UNINSTALL
   Delete the three DLLs.
 
-Requirements: Azimuth 0.9.9, Forza Horizon 2 1.0.0.64, AMD RX 9000 GPU (RX 7000 should work).
+Requirements: Azimuth 1.0.x, Forza Horizon 2 1.0.0.64, AMD RX 9000 GPU (RX 7000 should work).
 Log: fh2_fsr.log in the Azimuth folder.
 
 The amd_fidelityfx_* DLLs belong to AMD (FSR SDK 2.3.0) and are redistributed unmodified

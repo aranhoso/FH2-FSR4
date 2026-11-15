@@ -10,7 +10,7 @@ It is an unofficial mod, not affiliated with AMD, Microsoft, Playground Games or
 
 | | |
 |---|---|
-| Azimuth | 0.9.9 |
+| Azimuth | 1.0.x (render-pass hashes taken from Azimuth 1.0.3 / 1.0.4) |
 | Forza Horizon 2 | build 1.0.0.64 (your own copy, set up in Azimuth) |
 | GPU | AMD Radeon RX 9000 (RDNA 4). RX 7000 (RDNA 3) should also work, since AMD enabled FSR 4.1 for it in SDK 2.3.0 |
 | Driver | A recent AMD Software: Adrenalin |
@@ -36,8 +36,8 @@ It works alongside [FH2 Extra Options](https://github.com/RokkuDayo/ForzaHorizon
 | Key | Action |
 |---|---|
 | **F11** | Toggle FSR on/off (handy for comparisons) |
-| F9 | Motion-vector debug overlay: off, blended or opaque |
-| F10 | Overlay brightness scale |
+
+The key is polled from a dedicated thread, so F11 works even when the game is launched from Steam.
 
 The log is written to `fh2_fsr.log` in the Azimuth folder.
 
@@ -48,9 +48,13 @@ FH2 never had TAA, and FSR needs four things the game doesn't provide out of the
 - **Sub-pixel jitter:** offsets the viewport of the scene passes, only while the scene depth buffer is bound, following FSR's official jitter sequence.
 - **Full-resolution motion vectors:** FH2's motion blur already computes the reprojection of the camera and of each car (the matrix is picked by each object's stencil value), but at half resolution and with a clamped vector. The mod runs a variant of that shader at full resolution, without the clamp, using the game's own bindings.
 - **HDR colour and depth:** the mod takes the targets of the scene resolve, before tonemapping and the HUD.
-- **FSR dispatch:** FSR runs inside the game's own command list, right before the tonemap. Its output is copied back into the scene colour, and the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
+- **FSR dispatch:** FSR runs inside the game's own command list, right after the scene resolve. Its output is copied back into the scene colour, and the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
 
-The game's passes are identified by the DXBC checksums of their pixel shaders, and the resolve also by its render-target formats.
+The game's passes are identified by the DXBC checksums of their pixel shaders (the Azimuth 1.x builds), and the resolve is also validated by its render-target formats (R11G11B10 colour + D32 depth).
+
+## Azimuth 1.x notes
+
+On Azimuth 1.x the mod deliberately does **not** hook `Present`/`ResizeBuffers` on the swap chain: the Steam overlay hooks `Present` too, and with both on the vtable the game crashed at startup when launched from Steam. Azimuth 1.x may also own several swap chains, so Present is not a reliable frame boundary. Frame counting and the jitter state are driven from the scene resolve instead. When the game stops its velocity pass (pause/photo mode), the mod falls back to zero motion vectors with a history reset.
 
 ## Known limitations
 

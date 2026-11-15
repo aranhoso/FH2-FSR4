@@ -1,6 +1,18 @@
-/* FH2 FSR: FSR 4 Native AA for Azimuth (jitter, full-resolution motion vectors, debug overlay).
+/* FH2 FSR: FSR 4 Native AA for Azimuth (jitter, full-resolution motion vectors).
    Loaded as dxgi.dll next to azimuth.exe. Hooks D3D12CreateDevice through the exe's
-   import table, then device / command-list / factory / swap-chain vtables. */
+   import table, then device / command-list / factory / swap-chain vtables.
+
+   Azimuth 1.x compatibility (ported from the Azimuth-DLAA codebase, which runs on
+   Azimuth 1.0.3/1.0.4):
+   - No Present/ResizeBuffers hooks. The Steam overlay hooks Present too, and with both
+     mods on the swap chain's vtable the game crashed at startup when launched from Steam
+     (the overlay's Present calling itself until the stack overflowed). Azimuth 1.x may
+     also own multiple swap chains, whose Presents are not a reliable scene-frame boundary.
+     Frame counting and the end-of-frame jitter state are driven from the scene resolve
+     instead, and the F11 hotkey is polled from a dedicated thread.
+   - The recognised passes are the Azimuth 1.x shader hashes, FSR is dispatched right after
+     the scene resolve draw, and the passes may be issued as indexed draws, so
+     DrawIndexedInstanced is hooked as well. */
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
@@ -62,12 +74,11 @@ static void patch_slot(void **slot, void *hook, void **original) {
 
 /* ---------------------------------------------------------------- globals */
 
-/* DXBC checksums of the game's pixel shaders we key on. */
-static const DWORD MV_PS_HASH[4] = {0x2cfbd506, 0x9e9deb9f, 0x0ea59850, 0x7cc88f30};      /* motion blur velocity */
-static const DWORD RESOLVE_PS_HASH[4] = {0x576974a4, 0xf0c91dfd, 0xc3ca28aa, 0xe1f4ac4d}; /* scene colour+depth resolve */
-static const DWORD TONEMAP_PS_HASH[4] = {0x8d1cc763, 0x3a5f1f21, 0xb8f6e46b, 0x66bf6d19}; /* composite / tonemap */
+/* DXBC checksums of the game's pixel shaders we key on (Azimuth 1.0.3/1.0.4). */
+static const DWORD MV_PS_HASH[4] = {0x8a12870f, 0x60f7c6e9, 0x21d28459, 0x07b63a84};      /* motion blur velocity */
+static const DWORD RESOLVE_PS_HASH[4] = {0x1549a8f9, 0xd8526d4b, 0x60608dd5, 0x6ae7bb32}; /* scene colour+depth resolve */
 
-enum { ROLE_NONE, ROLE_MV, ROLE_RESOLVE, ROLE_TONEMAP };
+enum { ROLE_NONE, ROLE_MV, ROLE_RESOLVE };
 
 typedef HRESULT(WINAPI *PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
                                      ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **,
@@ -75,8 +86,6 @@ typedef HRESULT(WINAPI *PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_M
 
 static SRWLOCK pso_lock = SRWLOCK_INIT;
 static ID3D12Device *g_device;
-static ID3D12CommandQueue *g_queue;
-static DXGI_FORMAT g_backbuffer_format = DXGI_FORMAT_R10G10B10A2_UNORM;
 
 /* Game PSOs we recognise, with our full-resolution variant for the motion-vector pass. */
 #define MAX_VARIANTS 32
@@ -103,26 +112,12 @@ static ViewEntry views[MAX_VIEWS];
 /* Motion-vector target. */
 static ID3D12Resource *mv_tex;
 static UINT mv_w, mv_h;
-static ID3D12DescriptorHeap *rtv_heap;   /* 0: MV, 1..4: back buffers */
-static ID3D12DescriptorHeap *srv_heap;   /* shader visible, 0: MV */
+static ID3D12DescriptorHeap *rtv_heap;   /* 0: MV */
 static UINT rtv_inc;
-static volatile LONG64 mv_frame;         /* present count when MV was last written */
 static volatile LONG64 present_count;
 static ID3D12Resource *retired[16];
 static LONG64 retired_at[16];
 static SRWLOCK mv_lock = SRWLOCK_INIT;
-
-/* Overlay. */
-static ID3D12RootSignature *ov_root;
-static ID3D12PipelineState *ov_pso;
-static ID3D12CommandAllocator *ov_alloc[3];
-static ID3D12GraphicsCommandList *ov_list;
-static ID3D12Fence *ov_fence;
-static UINT64 ov_fence_value[3], ov_fence_next = 1;
-static HANDLE ov_event;
-static int overlay_mode;                 /* 0 off, 1 blended, 2 opaque */
-static float overlay_scale = 16.0f;      /* pixels of motion shown at full brightness */
-static int ov_ready, ov_failed;
 
 /* ---------------------------------------------------------------- originals */
 
@@ -135,6 +130,7 @@ static void(STDMETHODCALLTYPE *real_OMSetRenderTargets)(ID3D12GraphicsCommandLis
 static void(STDMETHODCALLTYPE *real_RSSetViewports)(ID3D12GraphicsCommandList *, UINT, const D3D12_VIEWPORT *);
 static void(STDMETHODCALLTYPE *real_RSSetScissorRects)(ID3D12GraphicsCommandList *, UINT, const D3D12_RECT *);
 static void(STDMETHODCALLTYPE *real_DrawInstanced)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, UINT);
+static void(STDMETHODCALLTYPE *real_DrawIndexedInstanced)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, INT, UINT);
 static void(STDMETHODCALLTYPE *real_ResourceBarrier)(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *);
 static void(STDMETHODCALLTYPE *real_SetDescriptorHeaps)(ID3D12GraphicsCommandList *, UINT, ID3D12DescriptorHeap *const *);
 static void(STDMETHODCALLTYPE *real_SetComputeRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
@@ -146,10 +142,6 @@ static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
 static HRESULT(STDMETHODCALLTYPE *real_CreateSwapChainForHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
-static HRESULT(STDMETHODCALLTYPE *real_Present)(IDXGISwapChain *, UINT, UINT);
-static HRESULT(STDMETHODCALLTYPE *real_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
-static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
-static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers1)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
 /* ---------------------------------------------------------------- shaders */
 
@@ -192,9 +184,6 @@ static int shader_role(const D3D12_SHADER_BYTECODE *ps) {
     if (!memcmp(h, RESOLVE_PS_HASH, 16)) {
         return ROLE_RESOLVE;
     }
-    if (!memcmp(h, TONEMAP_PS_HASH, 16)) {
-        return ROLE_TONEMAP;
-    }
     return ROLE_NONE;
 }
 
@@ -232,7 +221,7 @@ static void consider_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, ID3D12P
     }
     if (role != ROLE_MV) {
         remember_pso(pso, NULL, role);
-        log_msg("%s pass found (%s)", role == ROLE_RESOLVE ? "scene resolve" : "tonemap", source);
+        log_msg("scene resolve pass found (%s)", source);
         return;
     }
     ID3DBlob *ps = compile(MV_PS_HLSL, "main", "ps_5_0");
@@ -353,7 +342,6 @@ typedef struct {
 #define PROBE 16
 static ListState lists[MAX_LISTS];
 static SRWLOCK list_lock = SRWLOCK_INIT;
-static volatile LONG lists_created;
 
 static UINT list_hash(ID3D12GraphicsCommandList *cl) {
     UINT64 v = (UINT64)(uintptr_t)cl >> 4;
@@ -650,20 +638,14 @@ static D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle(ID3D12DescriptorHeap *heap, UINT i
 }
 
 static int ensure_heaps(void) {
-    if (rtv_heap && srv_heap) {
+    if (rtv_heap) {
         return 1;
     }
     D3D12_DESCRIPTOR_HEAP_DESC hd;
     memset(&hd, 0, sizeof(hd));
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 8;
+    hd.NumDescriptors = 1;
     if (FAILED(ID3D12Device_CreateDescriptorHeap(g_device, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap))) {
-        return 0;
-    }
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 4;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(ID3D12Device_CreateDescriptorHeap(g_device, &hd, &IID_ID3D12DescriptorHeap, (void **)&srv_heap))) {
         return 0;
     }
     rtv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(g_device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -716,8 +698,6 @@ static int ensure_mv(UINT w, UINT h) {
     }
     ID3D12Resource_SetName(mv_tex, L"FH2FSR MotionVectors");
     ID3D12Device_CreateRenderTargetView(g_device, mv_tex, NULL, cpu_handle(rtv_heap, 0, rtv_inc));
-    ID3D12Device_CreateShaderResourceView(g_device, mv_tex, NULL,
-                                          cpu_handle(srv_heap, 0, ID3D12Device_GetDescriptorHandleIncrementSize(g_device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)));
     mv_w = w;
     mv_h = h;
     log_msg("motion-vector texture %ux%u R16G16_FLOAT", w, h);
@@ -726,7 +706,6 @@ static int ensure_mv(UINT w, UINT h) {
 
 static volatile LONG64 mv_seq;          /* motion-vector passes recorded */
 static LONG64 fsr_mv_seq;                /* the motion-vector pass the last FSR dispatch used */
-static volatile LONG fsr_ran_since_present;
 
 static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
                            UINT vc, UINT ic, UINT sv, UINT si) {
@@ -752,7 +731,6 @@ static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12Pi
         if (s->num_sc) {
             real_RSSetScissorRects(cl, s->num_sc, s->sc);
         }
-        InterlockedExchange64(&mv_frame, present_count);
         InterlockedIncrement64(&mv_seq);
         static int once;
         if (!once) {
@@ -763,9 +741,44 @@ static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12Pi
     ReleaseSRWLockExclusive(&mv_lock);
 }
 
-static void note_scene_resources(ListState *s) {
+static void record_mv_pass_indexed(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
+                                   UINT index_count, UINT instance_count, UINT start_index,
+                                   INT base_vertex, UINT start_instance) {
+    /* The game's pass is at half the render resolution. */
+    UINT w = (UINT)(s->vp[0].Width * 2.0f + 0.5f), h = (UINT)(s->vp[0].Height * 2.0f + 0.5f);
+    AcquireSRWLockExclusive(&mv_lock);
+    if (ensure_mv(w, h)) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 0, rtv_inc);
+        D3D12_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+        D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        real_SetPipelineState(cl, variant);
+        real_OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+        real_RSSetViewports(cl, 1, &vp);
+        real_RSSetScissorRects(cl, 1, &sc);
+        real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        real_SetPipelineState(cl, s->pso);
+        real_OMSetRenderTargets(cl, s->num_rtv, s->num_rtv ? s->rtv : NULL, s->rtv_single,
+                                s->has_dsv ? &s->dsv : NULL);
+        apply_viewports(cl, s);
+        if (s->num_sc) {
+            real_RSSetScissorRects(cl, s->num_sc, s->sc);
+        }
+        InterlockedIncrement64(&mv_seq);
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("motion-vector replay using indexed draw");
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
+}
+
+/* The scene resolve's targets must match what FSR expects before we capture them. */
+static BOOL note_scene_resources(ListState *s) {
     if (!s->num_rtv || !s->has_dsv) {
-        return;
+        return FALSE;
     }
     const ViewEntry *c = view_find(s->rtv[0].ptr), *d = view_find(s->dsv.ptr);
     if (!c || !d || !c->resource || !d->resource) {
@@ -773,7 +786,16 @@ static void note_scene_resources(ListState *s) {
         if (!warned++) {
             log_msg("scene resolve: render-target/depth views not in the view map");
         }
-        return;
+        return FALSE;
+    }
+    if (c->format != DXGI_FORMAT_R11G11B10_FLOAT || d->format != DXGI_FORMAT_D32_FLOAT) {
+        static int format_warned;
+        if (!format_warned++) {
+            log_msg("scene resolve format mismatch: color=%d expected=%d depth=%d expected=%d; FSR capture skipped",
+                    (int)c->format, (int)DXGI_FORMAT_R11G11B10_FLOAT,
+                    (int)d->format, (int)DXGI_FORMAT_D32_FLOAT);
+        }
+        return FALSE;
     }
     if (c->resource != scene_color || d->resource != scene_depth) {
         scene_color = c->resource;
@@ -781,14 +803,59 @@ static void note_scene_resources(ListState *s) {
         log_msg("scene colour %p (%ux%u fmt %d), scene depth %p (%ux%u fmt %d)", (void *)scene_color, c->width,
                 c->height, (int)c->format, (void *)scene_depth, d->width, d->height, (int)d->format);
     }
+    return TRUE;
+}
+
+/* Once per scene frame, from run_fsr: old motion-vector textures are released 8 frames after
+   they were replaced, when the GPU is done with them. This used to be counted in a Present
+   hook, but the Steam overlay hooks Present too, and with both of them on the swap chain's
+   vtable the game crashed as it started, launched from Steam (the overlay's Present calling
+   itself until the stack overflowed). Azimuth may also own multiple swap chains, whose
+   Presents are not a reliable scene-frame boundary. */
+static void count_frame(void) {
+    InterlockedIncrement64(&present_count);
+    AcquireSRWLockExclusive(&mv_lock);
+    for (int i = 0; i < 16; ++i) {
+        if (retired[i] && present_count - retired_at[i] > 8) {
+            ID3D12Resource_Release(retired[i]);
+            retired[i] = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
 }
 
 static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     LONG64 seq = mv_seq;
-    if (!fsr_enabled() || !scene_color || !scene_depth || !mv_tex || seq == fsr_mv_seq) {
+    static LONG stale_resolves;
+    static LONG fallback_active;
+    int fallback = 0;
+
+    count_frame();
+    if (!fsr_enabled() || !scene_color || !scene_depth || !mv_tex) {
         return;
     }
-    fsr_mv_seq = seq;
+
+    if (seq == fsr_mv_seq) {
+        LONG n = InterlockedIncrement(&stale_resolves);
+        /* Some game states keep running the scene resolve while the velocity pass stops
+           (pause/photo). Never feed stale vectors back into FSR. After two consecutive
+           resolves with no fresh MV pass, switch to a history-reset fallback: zero vectors,
+           no temporal jitter, and a reset on every frame. */
+        if (n < 2) {
+            return;
+        }
+        fallback = 1;
+        if (!InterlockedExchange(&fallback_active, 1)) {
+            log_msg("FSR pause/photo fallback active: no fresh MV pass; using zero motion vectors with history reset");
+        }
+    } else {
+        InterlockedExchange(&stale_resolves, 0);
+        if (InterlockedExchange(&fallback_active, 0)) {
+            log_msg("FSR fresh motion vectors resumed; leaving pause/photo fallback");
+        }
+        fsr_mv_seq = seq;
+    }
+
     static int logged_states;
     if (!logged_states++) {
         log_msg("FSR inputs: colour state 0x%lx, depth state 0x%lx", scene_color_state, scene_depth_state);
@@ -798,6 +865,16 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     ListState saved = *s;
     LONG color_state = scene_color_state, depth_state = scene_depth_state;
     AcquireSRWLockShared(&mv_lock);
+    if (fallback) {
+        /* R16G16_FLOAT zero motion is valid for a disconnected/static frame. Clear the
+           texture instead of reusing the last gameplay vectors. */
+        const FLOAT zero[4] = {0, 0, 0, 0};
+        D3D12_CPU_DESCRIPTOR_HANDLE mv_rtv = cpu_handle(rtv_heap, 0, rtv_inc);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(cl, mv_rtv, zero, 0, NULL);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        /* fsr_end_frame(0) below forces reset and keeps jitter disabled. */
+    }
     int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ReleaseSRWLockShared(&mv_lock);
@@ -805,50 +882,42 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     InterlockedExchange(&scene_depth_state, depth_state);
     *s = saved;
     restore_after_fsr(cl, s);
-    if (ok) {
-        InterlockedExchange(&fsr_ran_since_present, 1);
-    }
-}
-
-/* The resolve draw by its targets, for builds of the shader we have no hash for (the game's
-   resolve shader differs with Azimuth's MSAA setting): one R11G11B10 colour target plus a
-   depth-only D32 target, both at the motion-vector (render) size. */
-static BOOL looks_like_resolve(ListState *s) {
-    if (s->num_rtv != 1 || !s->has_dsv || !mv_w) {
-        return FALSE;
-    }
-    const ViewEntry *c = view_find(s->rtv[0].ptr);
-    if (!c || c->format != DXGI_FORMAT_R11G11B10_FLOAT || c->width != mv_w || c->height != mv_h) {
-        return FALSE;
-    }
-    const ViewEntry *d = view_find(s->dsv.ptr);
-    if (!d || (d->format != DXGI_FORMAT_D32_FLOAT && d->format != DXGI_FORMAT_R32_TYPELESS) ||
-        d->width != mv_w || d->height != mv_h) {
-        return FALSE;
-    }
-    static ID3D12PipelineState *logged;
-    if (logged != s->pso) {
-        logged = s->pso;
-        log_msg("scene resolve recognised by its targets (PSO %p)", (void *)s->pso);
-    }
-    return TRUE;
+    /* In normal gameplay, a successful FSR dispatch enables next-frame jitter. Fallback
+       frames deliberately remain disconnected from history: fsr_end_frame(0) keeps reset
+       asserted and suppresses camera jitter until fresh MVs return. */
+    fsr_end_frame((!fallback && ok) ? 1 : 0);
 }
 
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
-    if (role == ROLE_NONE && s && looks_like_resolve(s)) {
-        role = ROLE_RESOLVE;
-    }
-    if (role == ROLE_RESOLVE) {
-        note_scene_resources(s);
-    } else if (role == ROLE_MV && variant && s->num_vp) {
+    if (role == ROLE_RESOLVE && s) {
+        BOOL scene_ok = note_scene_resources(s);
+        real_DrawInstanced(cl, vc, ic, sv, si);
+        if (scene_ok) {
+            run_fsr(cl, s);
+        }
+        return;
+    } else if (role == ROLE_MV && variant && s && s->num_vp) {
         record_mv_pass(cl, s, variant, vc, ic, sv, si);
-    } else if (role == ROLE_TONEMAP) {
-        run_fsr(cl, s);
     }
     real_DrawInstanced(cl, vc, ic, sv, si);
+}
+
+static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *cl, UINT index_count,
+                                                        UINT instance_count, UINT start_index,
+                                                        INT base_vertex, UINT start_instance) {
+    ListState *s = state_for(cl);
+    ID3D12PipelineState *variant = NULL;
+    int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
+    if (role == ROLE_RESOLVE && s) {
+        /* FH2's resolve is a plain (non-indexed) draw on Azimuth 1.x; just track its targets. */
+        note_scene_resources(s);
+    } else if (role == ROLE_MV && variant && s && s->num_vp) {
+        record_mv_pass_indexed(cl, s, variant, index_count, instance_count, start_index, base_vertex, start_instance);
+    }
+    real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
 }
 
 /* ---------------------------------------------------------------- device hooks */
@@ -860,6 +929,7 @@ static void hook_command_list(ID3D12GraphicsCommandList *cl) {
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, RSSetViewports), (void *)hook_RSSetViewports, (void **)&real_RSSetViewports);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, RSSetScissorRects), (void *)hook_RSSetScissorRects, (void **)&real_RSSetScissorRects);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, DrawInstanced), (void *)hook_DrawInstanced, (void **)&real_DrawInstanced);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced), (void *)hook_DrawIndexedInstanced, (void **)&real_DrawIndexedInstanced);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, ResourceBarrier), (void *)hook_ResourceBarrier, (void **)&real_ResourceBarrier);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetDescriptorHeaps), (void *)hook_SetDescriptorHeaps, (void **)&real_SetDescriptorHeaps);
     patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetComputeRootSignature), (void *)hook_SetComputeRootSignature, (void **)&real_SetComputeRootSignature);
@@ -878,10 +948,6 @@ static HRESULT STDMETHODCALLTYPE hook_CreateCommandList(ID3D12Device *dev, UINT 
             ListState *s = state_for(cl);
             if (s) {
                 s->pso = pso;
-            }
-            LONG n = InterlockedIncrement(&lists_created);
-            if (n == 1 || n == 16 || n == 256 || n % 4096 == 0) {
-                log_msg("direct command lists created so far: %ld", n);
             }
             ID3D12GraphicsCommandList_Release(cl);
         }
@@ -907,262 +973,61 @@ static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVE
     return hr;
 }
 
-/* ---------------------------------------------------------------- overlay */
+/* ---------------------------------------------------------------- hotkey */
 
-static int ensure_overlay(void) {
-    if (ov_ready || ov_failed) {
-        return ov_ready;
-    }
-    ov_failed = 1;
-    D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-    D3D12_ROOT_PARAMETER params[2];
-    memset(params, 0, sizeof(params));
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[0].DescriptorTable.NumDescriptorRanges = 1;
-    params[0].DescriptorTable.pDescriptorRanges = &range;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 4;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rs = {2, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    typedef HRESULT(WINAPI * PFN_Ser)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
-    PFN_Ser ser = (PFN_Ser)(void *)GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature");
-    ID3DBlob *blob = NULL, *err = NULL;
-    if (!ser || FAILED(ser(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
-        log_msg("overlay root signature serialization failed");
-        return 0;
-    }
-    HRESULT hr = ID3D12Device_CreateRootSignature(g_device, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
-                                                  &IID_ID3D12RootSignature, (void **)&ov_root);
-    ID3D10Blob_Release(blob);
-    if (FAILED(hr)) {
-        return 0;
-    }
-    ID3DBlob *vs = compile(OVERLAY_HLSL, "vs", "vs_5_0"), *ps = compile(OVERLAY_HLSL, "ps", "ps_5_0");
-    if (!vs || !ps) {
-        return 0;
-    }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
-    memset(&d, 0, sizeof(d));
-    d.pRootSignature = ov_root;
-    d.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs);
-    d.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
-    d.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
-    d.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
-    D3D12_RENDER_TARGET_BLEND_DESC *bt = &d.BlendState.RenderTarget[0];
-    bt->BlendEnable = TRUE;
-    bt->SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    bt->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    bt->BlendOp = D3D12_BLEND_OP_ADD;
-    bt->SrcBlendAlpha = D3D12_BLEND_ONE;
-    bt->DestBlendAlpha = D3D12_BLEND_ZERO;
-    bt->BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    bt->LogicOp = D3D12_LOGIC_OP_NOOP;
-    bt->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
-    d.SampleMask = UINT_MAX;
-    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    d.RasterizerState.DepthClipEnable = TRUE;
-    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    d.NumRenderTargets = 1;
-    d.RTVFormats[0] = g_backbuffer_format;
-    d.SampleDesc.Count = 1;
-    hr = real_CreateGraphicsPipelineState(g_device, &d, &IID_ID3D12PipelineState, (void **)&ov_pso);
-    ID3D10Blob_Release(vs);
-    ID3D10Blob_Release(ps);
-    if (FAILED(hr)) {
-        log_msg("overlay PSO failed 0x%08lx", hr);
-        return 0;
-    }
-    for (int i = 0; i < 3; ++i) {
-        if (FAILED(ID3D12Device_CreateCommandAllocator(g_device, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&ov_alloc[i]))) {
-            return 0;
-        }
-    }
-    if (FAILED(real_CreateCommandList(g_device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, ov_alloc[0], NULL,
-                                      &IID_ID3D12GraphicsCommandList, (void **)&ov_list))) {
-        return 0;
-    }
-    ID3D12GraphicsCommandList_Close(ov_list);
-    if (FAILED(ID3D12Device_CreateFence(g_device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&ov_fence))) {
-        return 0;
-    }
-    ov_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    ov_failed = 0;
-    ov_ready = 1;
-    log_msg("overlay ready (back buffer format %d)", (int)g_backbuffer_format);
-    return 1;
-}
-
-static void poll_keys(void) {
-    static SHORT last9, last10, last11;
+static void poll_f11(void) {
+    static SHORT last;
+    SHORT now = GetAsyncKeyState(VK_F11) & 0x8000;
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) {
         GetWindowThreadProcessId(fg, &pid);
     }
     if (pid != GetCurrentProcessId()) {
+        last = now;
         return;
     }
-    SHORT k9 = GetAsyncKeyState(VK_F9) & 0x8000, k10 = GetAsyncKeyState(VK_F10) & 0x8000;
-    if (k9 && !last9) {
-        overlay_mode = (overlay_mode + 1) % 3;
-        log_msg("overlay mode %d", overlay_mode);
-    }
-    if (k10 && !last10) {
-        overlay_scale = overlay_scale >= 64.0f ? 2.0f : overlay_scale * 2.0f;
-        log_msg("overlay full brightness at %.0f px of motion", overlay_scale);
-    }
-    SHORT k11 = GetAsyncKeyState(VK_F11) & 0x8000;
-    if (k11 && !last11) {
+    if (now && !last) {
         fsr_toggle();
     }
-    last9 = k9;
-    last10 = k10;
-    last11 = k11;
+    last = now;
 }
 
-static void draw_overlay(IDXGISwapChain *sc) {
-    if (!overlay_mode || !g_queue || !mv_tex || present_count - mv_frame > 1 || !ensure_overlay()) {
-        return;
+static volatile LONG hotkey_thread_started;
+
+static DWORD WINAPI hotkey_thread_main(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        poll_f11();
+        Sleep(10);
     }
-    IDXGISwapChain3 *sc3 = NULL;
-    if (FAILED(IDXGISwapChain_QueryInterface(sc, &IID_IDXGISwapChain3, (void **)&sc3))) {
-        return;
-    }
-    UINT index = IDXGISwapChain3_GetCurrentBackBufferIndex(sc3);
-    ID3D12Resource *bb = NULL;
-    HRESULT hr = IDXGISwapChain3_GetBuffer(sc3, index, &IID_ID3D12Resource, (void **)&bb);
-    IDXGISwapChain3_Release(sc3);
-    if (FAILED(hr)) {
-        return;
-    }
-    D3D12_RESOURCE_DESC bd;
-    bb->lpVtbl->GetDesc(bb, &bd);
-    UINT slot = (UINT)(ov_fence_next % 3);
-    if (ID3D12Fence_GetCompletedValue(ov_fence) < ov_fence_value[slot]) {
-        ID3D12Fence_SetEventOnCompletion(ov_fence, ov_fence_value[slot], ov_event);
-        WaitForSingleObject(ov_event, 100);
-    }
-    ID3D12CommandAllocator_Reset(ov_alloc[slot]);
-    real_Reset(ov_list, ov_alloc[slot], ov_pso);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 1 + (index & 3), rtv_inc);
-    D3D12_RENDER_TARGET_VIEW_DESC rv;
-    memset(&rv, 0, sizeof(rv));
-    rv.Format = g_backbuffer_format;
-    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-    ID3D12Device_CreateRenderTargetView(g_device, bb, &rv, rtv);
-    transition(ov_list, bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    AcquireSRWLockShared(&mv_lock);
-    ID3D12GraphicsCommandList_SetDescriptorHeaps(ov_list, 1, &srv_heap);
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(ov_list, ov_root);
-    D3D12_GPU_DESCRIPTOR_HANDLE gh;
-    srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &gh);
-    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(ov_list, 0, gh);
-    struct {
-        UINT mode;
-        float scale, w, h;
-    } c = {(UINT)overlay_mode, overlay_scale, (float)bd.Width, (float)bd.Height};
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(ov_list, 1, 4, &c, 0);
-    real_OMSetRenderTargets(ov_list, 1, &rtv, FALSE, NULL);
-    D3D12_VIEWPORT vp = {0, 0, (float)bd.Width, (float)bd.Height, 0, 1};
-    D3D12_RECT r = {0, 0, (LONG)bd.Width, (LONG)bd.Height};
-    real_RSSetViewports(ov_list, 1, &vp);
-    real_RSSetScissorRects(ov_list, 1, &r);
-    ID3D12GraphicsCommandList_IASetPrimitiveTopology(ov_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    real_DrawInstanced(ov_list, 3, 1, 0, 0);
-    transition(ov_list, bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    ID3D12GraphicsCommandList_Close(ov_list);
-    ID3D12CommandList *lists_[1] = {(ID3D12CommandList *)ov_list};
-    ID3D12CommandQueue_ExecuteCommandLists(g_queue, 1, lists_);
-    ReleaseSRWLockShared(&mv_lock);
-    ov_fence_value[slot] = ov_fence_next;
-    ID3D12CommandQueue_Signal(g_queue, ov_fence, ov_fence_next++);
-    ID3D12Resource_Release(bb);
 }
 
-static void before_present(IDXGISwapChain *sc) {
-    poll_keys();
-    draw_overlay(sc);
-    fsr_end_frame(InterlockedExchange(&fsr_ran_since_present, 0));
-    InterlockedIncrement64(&present_count);
-    AcquireSRWLockExclusive(&mv_lock);
-    for (int i = 0; i < 16; ++i) {
-        if (retired[i] && present_count - retired_at[i] > 8) {
-            ID3D12Resource_Release(retired[i]);
-            retired[i] = NULL;
-        }
+static void ensure_hotkey_thread(void) {
+    if (InterlockedCompareExchange(&hotkey_thread_started, 1, 0) != 0) {
+        return;
     }
-    ReleaseSRWLockExclusive(&mv_lock);
+    HANDLE thread = CreateThread(NULL, 0, hotkey_thread_main, NULL, 0, NULL);
+    if (!thread) {
+        InterlockedExchange(&hotkey_thread_started, 0);
+        log_msg("F11 hotkey thread failed to start (error %lu)", GetLastError());
+        return;
+    }
+    CloseHandle(thread);
 }
 
 /* ---------------------------------------------------------------- swap chain */
 
-static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags) {
-    if (!(flags & DXGI_PRESENT_TEST)) {
-        before_present(sc);
-    }
-    return real_Present(sc, sync, flags);
-}
-
-static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) {
-    if (!(flags & DXGI_PRESENT_TEST)) {
-        before_present((IDXGISwapChain *)sc);
-    }
-    return real_Present1(sc, sync, flags, p);
-}
-
-static void flush_overlay(void) {
-    if (ov_fence && g_queue && ov_fence_next > 1) {
-        if (ID3D12Fence_GetCompletedValue(ov_fence) < ov_fence_next - 1) {
-            ID3D12Fence_SetEventOnCompletion(ov_fence, ov_fence_next - 1, ov_event);
-            WaitForSingleObject(ov_event, 1000);
-        }
-    }
-}
-
-static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers(IDXGISwapChain *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
-    flush_overlay();
-    if (f != DXGI_FORMAT_UNKNOWN && f != g_backbuffer_format) {
-        log_msg("back buffer format changed to %d; overlay disabled", (int)f);
-        ov_failed = 1;
-    }
-    return real_ResizeBuffers(sc, n, w, h, f, fl);
-}
-
-static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers1(IDXGISwapChain3 *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl,
-                                                     const UINT *mask, IUnknown *const *queues) {
-    flush_overlay();
-    if (f != DXGI_FORMAT_UNKNOWN && f != g_backbuffer_format) {
-        log_msg("back buffer format changed to %d; overlay disabled", (int)f);
-        ov_failed = 1;
-    }
-    return real_ResizeBuffers1(sc, n, w, h, f, fl, mask, queues);
-}
-
+/* No Present/ResizeBuffers hooks here: see the note at count_frame(). The swap chain hook
+   only starts the hotkey thread. */
 static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, IUnknown *device, HWND hwnd,
                                                              const DXGI_SWAP_CHAIN_DESC1 *desc,
                                                              const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
                                                              IDXGIOutput *out, IDXGISwapChain1 **sc) {
     HRESULT hr = real_CreateSwapChainForHwnd(f, device, hwnd, desc, fs, out, sc);
     if (SUCCEEDED(hr) && sc && *sc) {
-        ID3D12CommandQueue *q = NULL;
-        if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&q))) {
-            if (g_queue) {
-                ID3D12CommandQueue_Release(g_queue);
-            }
-            g_queue = q;
-        }
-        g_backbuffer_format = desc->Format;
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present), (void *)hook_Present, (void **)&real_Present);
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1), (void *)hook_Present1, (void **)&real_Present1);
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, ResizeBuffers), (void *)hook_ResizeBuffers, (void **)&real_ResizeBuffers);
-        IDXGISwapChain3 *sc3 = NULL;
-        if (SUCCEEDED(IDXGISwapChain1_QueryInterface(*sc, &IID_IDXGISwapChain3, (void **)&sc3))) {
-            patch_slot(VT_SLOT(sc3, IDXGISwapChain3Vtbl, ResizeBuffers1), (void *)hook_ResizeBuffers1, (void **)&real_ResizeBuffers1);
-            IDXGISwapChain3_Release(sc3);
-        }
-        log_msg("swap chain %ux%u format %d hooked (queue %p)", desc->Width, desc->Height, (int)desc->Format, (void *)g_queue);
+        ensure_hotkey_thread();
+        log_msg("swap chain %ux%u format %d hooked", desc->Width, desc->Height, (int)desc->Format);
     }
     return hr;
 }
@@ -1252,7 +1117,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         }
         lstrcpyW(path + n, L"fh2_fsr.log");
         log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        log_msg("FH2 FSR 4 Native AA. F11: FSR on/off, F9: motion-vector overlay off/blended/opaque, F10: overlay scale");
+        log_msg("FH2 FSR 4 Native AA (Azimuth 1.x). F11: FSR on/off");
         log_msg(patch_exe_import() ? "D3D12CreateDevice import patched" : "D3D12CreateDevice import NOT found");
     }
     return TRUE;
