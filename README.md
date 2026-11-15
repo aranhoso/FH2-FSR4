@@ -41,23 +41,23 @@ The key is polled from a dedicated thread, so F11 works even when the game is la
 
 ## FSR upscaling
 
-Azimuth 1.x renders the game into a render-resolution swap chain (`resolution=` / `aspect=` in `data\azimuth.ini`) and stretches the frame onto the display-resolution window chain with a bilinear draw. When the render size is smaller than the display size, this mod replaces that stretch with FSR 4 upscaling:
+Azimuth 1.x renders the game at the render resolution (`resolution=` / `aspect=` in `data\azimuth.ini`) into the HDR scene buffer and stretches/tonemaps it onto the display-sized back buffer itself. When the render size is smaller than the display size, this mod upscales the HDR scene with FSR 4 right after the scene resolve and redirects the game's scene-colour texture bindings to the upscaled image, so the game's own present pass tonemaps the upscaled frame into the back buffer (pillarboxing and the HUD are handled by the game at display resolution and stay crisp).
 
-1. Set e.g. `resolution=1080` with `aspect=21:9` in `data\azimuth.ini` on a 3440x1440 display (keep `antialiasing=off`).
-2. Launch as usual. `fh2_fsr.log` reports `mode upscale` and `first FSR upscale recorded: render 2580x1080 -> ...`.
+1. Set e.g. `resolution=1080` with `aspect=21:9` (match your display's aspect) in `data\azimuth.ini` on a 3440x1440 display (keep `antialiasing=off`).
+2. Launch as usual. `fh2_fsr.log` reports `upscale mode: render 2580x1080 < display 3440x1440` and `FSR frame N (upscale, render 2580x1080 -> out 3440x1440)`.
 
-When render size == display size, the mod automatically stays in Native AA mode.
+When render size == display size, the mod automatically stays in Native AA mode. Works the same with HDR on or off — the scene buffer is linear HDR either way; only the game's final tonemap differs.
 
 Optional `fh2_fsr.ini` next to the DLLs:
 
 ```ini
 [fsr]
 mode=auto        ; auto | native | upscale
-hdr=auto         ; auto | on | off  (FSR HDR flag; auto = on for R10G10B10A2 back buffers)
+hdr=auto         ; auto | on | off  (FSR HDR flag on the scene input; auto = on)
 sharpness=-1     ; -1 = off, 0..1 = FSR sharpening strength (1 = max)
 ```
 
-In upscale mode the HUD is part of the upscaled frame. Motion vectors, depth and camera jitter are taken from the game's own passes at render resolution, so they scale automatically.
+Motion vectors, depth and camera jitter are taken from the game's own passes at render resolution, so they scale automatically with the render size.
 
 The log is written to `fh2_fsr.log` in the Azimuth folder.
 
@@ -68,7 +68,7 @@ FH2 never had TAA, and FSR needs four things the game doesn't provide out of the
 - **Sub-pixel jitter:** offsets the viewport of the scene passes, only while the scene depth buffer is bound, following FSR's official jitter sequence.
 - **Full-resolution motion vectors:** FH2's motion blur already computes the reprojection of the camera and of each car (the matrix is picked by each object's stencil value), but at half resolution and with a clamped vector. The mod runs a variant of that shader at full resolution, without the clamp, using the game's own bindings.
 - **HDR colour and depth:** the mod takes the targets of the scene resolve, before tonemapping and the HUD.
-- **FSR dispatch:** in Native AA mode, FSR runs inside the game's own command list right after the scene resolve, and its output is copied back into the scene colour. In upscale mode, FSR runs on Azimuth's display pass (the game->window frame transfer) and its output is copied into the window back buffer over the draw's viewport. Either way the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
+- **FSR dispatch:** FSR runs inside the game's own command list right after the scene resolve. In Native AA mode its output is copied back into the scene colour in place; in upscale mode (render < display) the output is the scene upscaled to the display-fitted size and the game's scene-colour SRV descriptors are redirected to it. Either way the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
 
 The game's passes are identified by the DXBC checksums of their pixel shaders (the Azimuth 1.x builds), and the resolve is also validated by its render-target formats (R11G11B10 colour + D32 depth).
 

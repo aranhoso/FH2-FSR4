@@ -123,11 +123,19 @@ static int create_context(UINT w, UINT h, UINT out_w, UINT out_h, DXGI_FORMAT ou
     }
     if (ctx) {
         /* Size change: the old context may still be referenced by in-flight work, so it is
-           leaked rather than destroyed mid-frame. Rare (only when a size changes). */
-        log_msg("FSR: size changed to render %ux%u -> out %ux%u fmt %d, recreating context", w, h, out_w, out_h, (int)out_fmt);
+           leaked rather than destroyed mid-frame. Rare (only when a size changes). Guard
+           against thrashing (which would leak a context + texture per frame). */
+        static int recreate_count;
+        if (++recreate_count > 8) {
+            log_msg("FSR: context recreated %d times; disabling FSR to avoid thrashing", recreate_count);
+            ctx_failed = 1;
+            return 0;
+        }
+        log_msg("FSR: size changed to render %ux%u -> out %ux%u fmt %d, recreating context (#%d)", w, h, out_w, out_h,
+                (int)out_fmt, recreate_count);
         ctx = NULL;
         if (out_tex) {
-            out_tex = NULL;
+            out_tex = NULL; /* leaked on purpose: SRV descriptors may still point at it */
         }
     }
     struct ffxCreateBackendDX12Desc backend;
@@ -226,37 +234,16 @@ static struct FfxApiResource ffx_resource(ID3D12Resource *r, uint32_t format, ui
 
 #define READ_STATE (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
 
-static ffxReturnCode_t to_ffx_format(DXGI_FORMAT f, uint32_t *out) {
-    switch (f) {
-    case DXGI_FORMAT_R11G11B10_FLOAT: *out = FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT; return FFX_API_RETURN_OK;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: *out = FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM; return FFX_API_RETURN_OK;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: *out = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM; return FFX_API_RETURN_OK;
-    case DXGI_FORMAT_R16G16_FLOAT: *out = FFX_API_SURFACE_FORMAT_R16G16_FLOAT; return FFX_API_RETURN_OK;
-    case DXGI_FORMAT_R32_FLOAT: *out = FFX_API_SURFACE_FORMAT_R32_FLOAT; return FFX_API_RETURN_OK;
-    default: return FFX_API_RETURN_ERROR;
-    }
-}
-
 int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state,
             ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state, ID3D12Resource *motion,
-            D3D12_RESOURCE_STATES motion_state, UINT out_w, UINT out_h, DXGI_FORMAT out_fmt,
-            DXGI_FORMAT color_fmt) {
+            D3D12_RESOURCE_STATES motion_state, UINT out_w, UINT out_h) {
     if (!enabled) {
         return 0;
     }
     D3D12_RESOURCE_DESC cd;
     color->lpVtbl->GetDesc(color, &cd);
     UINT w = (UINT)cd.Width, h = cd.Height;
-    if (!create_context(w, h, out_w, out_h, out_fmt)) {
-        return 0;
-    }
-    uint32_t color_f, out_f;
-    if (to_ffx_format(color_fmt, &color_f) != FFX_API_RETURN_OK ||
-        to_ffx_format(out_fmt, &out_f) != FFX_API_RETURN_OK) {
-        static int warned_fmt;
-        if (!warned_fmt++) {
-            log_msg("FSR: unsupported format pair color %d out %d", (int)color_fmt, (int)out_fmt);
-        }
+    if (!create_context(w, h, out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT)) {
         return 0;
     }
     /* Everything FSR reads goes to the shader-read state it is told about. */
@@ -273,10 +260,10 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
     memset(&d, 0, sizeof(d));
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = cl;
-    d.color = ffx_resource(color, color_f, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    d.color = ffx_resource(color, FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.depth = ffx_resource(depth, FFX_API_SURFACE_FORMAT_R32_FLOAT, FFX_API_RESOURCE_USAGE_DEPTHTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     d.motionVectors = ffx_resource(motion, FFX_API_SURFACE_FORMAT_R16G16_FLOAT, FFX_API_RESOURCE_USAGE_RENDERTARGET, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    d.output = ffx_resource(out_tex, out_f, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.output = ffx_resource(out_tex, FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     d.jitterOffset.x = jitter_used ? jx : 0.0f;
     d.jitterOffset.y = jitter_used ? jy : 0.0f;
     /* Our motion vectors are UV-space offsets from current to previous position. */
@@ -317,8 +304,8 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
         static int once;
         if (!once) {
             once = 1;
-            log_msg("first FSR dispatch recorded (render %ux%u -> out %ux%u fmt %d, jitter %.3f %.3f)", w, h, out_w,
-                    out_h, (int)out_fmt, d.jitterOffset.x, d.jitterOffset.y);
+            log_msg("first FSR dispatch recorded (render %ux%u -> out %ux%u, jitter %.3f %.3f)", w, h, out_w,
+                    out_h, d.jitterOffset.x, d.jitterOffset.y);
         }
         need_reset = 0;
         /* Next frame's jitter. Advancing here ties the sequence to rendered scenes. */
