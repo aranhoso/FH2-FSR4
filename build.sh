@@ -5,9 +5,18 @@
 # The AMD FSR API headers and DLLs come from the official FSR SDK v2.3.0 (FSR Upscaling 4.1.1).
 set -e
 cd "$(dirname "$0")"
-VERSION=0.1.0
+VERSION=0.2.0
 SDK_TAG=v2.3.0
 ZIG=${ZIG:-zig}
+
+# Build dependencies: Zig 0.15.2 (compiler), git + network (one-time sparse clone of the
+# FSR SDK headers into third_party/), and for `release` mode curl + unzip (signed AMD DLLs;
+# zip is optional, tar.exe is used as fallback).
+if ! command -v "$ZIG" >/dev/null 2>&1; then
+    echo "zig not found at '$ZIG'. Install Zig 0.15.2 (https://ziglang.org/download/) and rerun:" >&2
+    echo "  ZIG=/path/to/zig ./build.sh" >&2
+    exit 1
+fi
 
 # FSR API headers: sparse checkout of the official SDK repository.
 FFX=third_party/FidelityFX-SDK

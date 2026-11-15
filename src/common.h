@@ -20,5 +20,7 @@ int fsr_jitter(float *x, float *y);
 int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE_STATES color_state,
             ID3D12Resource *depth, D3D12_RESOURCE_STATES depth_state, ID3D12Resource *motion,
             D3D12_RESOURCE_STATES motion_state);
-/* Called once per Present: advances the jitter sequence. `ran` says whether FSR ran this frame. */
+/* Called once per scene resolve: updates the jitter live/reset state. `ran` says whether
+   FSR ran this frame. (Not driven from Present: Azimuth 1.x swap chains are not a reliable
+   frame boundary and Present is also hooked by the Steam overlay.) */
 void fsr_end_frame(int ran);
