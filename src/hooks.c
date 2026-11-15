@@ -108,8 +108,9 @@ typedef struct {
     UINT8 kind;           /* 0 none, 1 RTV, 2 DSV, 3 SRV */
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;  /* saved desc when kind == 3 */
 } ViewEntry;
-#define MAX_VIEWS 16384
+#define MAX_VIEWS 65536
 static ViewEntry views[MAX_VIEWS];
+static UINT scene_w, scene_h;   /* render size, from the scene colour at the resolve */
 
 /* Motion-vector target. */
 static ID3D12Resource *mv_tex;
@@ -419,7 +420,7 @@ static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI
                         UINT8 kind, const D3D12_SHADER_RESOURCE_VIEW_DESC *srv_desc) {
     UINT i = view_hash(h.ptr);
     ViewEntry *e = NULL;
-    for (UINT k = 0; k < 32; ++k) {
+    for (UINT k = 0; k < 64; ++k) {
         ViewEntry *c = &views[(i + k) & (MAX_VIEWS - 1)];
         if (c->handle == h.ptr || !c->handle) {
             e = c;
@@ -460,7 +461,7 @@ static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI
 
 static const ViewEntry *view_find(SIZE_T handle) {
     UINT i = view_hash(handle);
-    for (UINT k = 0; k < 32; ++k) {
+    for (UINT k = 0; k < 64; ++k) {
         const ViewEntry *c = &views[(i + k) & (MAX_VIEWS - 1)];
         if (c->handle == handle) {
             return c;
@@ -898,6 +899,8 @@ static BOOL note_scene_resources(ListState *s) {
     if (c->resource != scene_color || d->resource != scene_depth) {
         scene_color = c->resource;
         scene_depth = d->resource;
+        scene_w = c->width;
+        scene_h = c->height;
         log_msg("scene colour %p (%ux%u fmt %d), scene depth %p (%ux%u fmt %d)", (void *)scene_color, c->width,
                 c->height, (int)c->format, (void *)scene_depth, d->width, d->height, (int)d->format);
     }
@@ -964,9 +967,16 @@ static SIZE_T scene_srv[16];
 static int scene_srv_n;
 static int cfg_debug_blink;
 
+/* A descriptor is "the scene" if it is an SRV on a render-sized HDR (R11G11B10) texture —
+   that covers the scene colour itself and any staging copies of it. */
+static int is_scene_srv(const ViewEntry *e) {
+    return e && e->kind == 3 && e->resource && e->format == DXGI_FORMAT_R11G11B10_FLOAT &&
+           e->width == scene_w && e->height == scene_h;
+}
+
 static void overwrite_srv(ID3D12Resource *up, SIZE_T cpu_handle) {
     const ViewEntry *e = view_find(cpu_handle);
-    if (!e || e->kind != 3 || e->resource != scene_color || !g_device) {
+    if (!is_scene_srv(e) || !g_device) {
         return;
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
@@ -980,16 +990,16 @@ static void overwrite_srv(ID3D12Resource *up, SIZE_T cpu_handle) {
     ID3D12Device_CreateShaderResourceView(g_device, up, &d, h);
 }
 
-/* Collect the scene colour's SRV handles and point them at the FSR output. Called at the resolve. */
+/* Collect the scene's SRV handles and point them at the FSR output. Called at the resolve. */
 static void redirect_scene_srv(ID3D12Resource *up) {
-    if (!up || !scene_color || !g_device) {
+    if (!up || !scene_color || !g_device || !scene_w) {
         return;
     }
     scene_srv_n = 0;
     int n = 0;
     for (UINT i = 0; i < MAX_VIEWS; ++i) {
         ViewEntry *e = &views[i];
-        if (e->handle && e->kind == 3 && e->resource == scene_color) {
+        if (e->handle && is_scene_srv(e)) {
             if (scene_srv_n < 16) {
                 scene_srv[scene_srv_n++] = e->handle;
             }
@@ -1016,7 +1026,7 @@ static void restore_scene_srv(void) {
     }
     for (int i = 0; i < scene_srv_n; ++i) {
         const ViewEntry *e = view_find(scene_srv[i]);
-        if (e && e->kind == 3 && e->handle) {
+        if (e && e->kind == 3 && e->handle && e->resource) {
             D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
             if (d.Format == DXGI_FORMAT_UNKNOWN) {
                 D3D12_RESOURCE_DESC rd;
@@ -1046,7 +1056,7 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
         if (s->root_srv_mask & (1u << i)) {
             SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i]);
             const ViewEntry *e = cpu ? view_find(cpu) : NULL;
-            if (e && e->kind == 3 && e->resource == scene_color) {
+            if (is_scene_srv(e)) {
                 real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
                 ++bound_scene;
             }
@@ -1054,13 +1064,13 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
         if (s->tables_mask & (1u << i)) {
             SIZE_T base = gpu_to_cpu(s, s->tables[i]);
             if (base && g_srv_inc) {
-                /* a table is a contiguous descriptor range; scan it for the scene colour */
+                /* a table is a contiguous descriptor range; scan it for the scene */
                 for (UINT k = 0; k < 64; ++k) {
                     const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
                     if (!e || !e->handle) {
                         break;
                     }
-                    if (e->kind == 3 && e->resource == scene_color) {
+                    if (is_scene_srv(e)) {
                         overwrite_srv(up, base + (SIZE_T)k * g_srv_inc);
                         ++bound_scene;
                     }
@@ -1099,10 +1109,11 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
                 for (UINT k = 0; k < 16; ++k) {
                     const ViewEntry *e = view_find(base + (SIZE_T)k * g_srv_inc);
                     if (!e || !e->handle) {
-                        break;
+                        log_msg("  binding %u[%u]: ?", t, k);
+                        continue;
                     }
                     log_msg("  binding %u[%u]: res %p %ux%u fmt %d kind %u%s", t, k, (void *)e->resource, e->width,
-                            e->height, (int)e->format, e->kind, e->resource == scene_color ? " <== scene" : "");
+                            e->height, (int)e->format, e->kind, is_scene_srv(e) ? " <== scene" : "");
                 }
             }
         }
