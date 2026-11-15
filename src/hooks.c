@@ -986,6 +986,10 @@ static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
 
     ID3D12Resource *bb = current_game_bb();
     if (!bb) {
+        static int warned_bb;
+        if (!warned_bb++) {
+            log_msg("upscale: game chain back buffer not available (chain_count=%d)", chain_count);
+        }
         return;
     }
     D3D12_RESOURCE_DESC bd;
@@ -1063,6 +1067,8 @@ static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
     }
 }
 
+static void diag_display_draw(ListState *s);
+
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
@@ -1080,6 +1086,7 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
     }
     real_DrawInstanced(cl, vc, ic, sv, si);
     if (s && s->win_bb) {
+        diag_display_draw(s);
         run_upscale(cl, s);
     }
 }
@@ -1098,8 +1105,29 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
     }
     real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
     if (s && s->win_bb) {
+        diag_display_draw(s);
         run_upscale(cl, s);
     }
+}
+
+/* Log each distinct PSO that draws into a display-sized back buffer (the display pass), once. */
+static void diag_display_draw(ListState *s) {
+    static ID3D12PipelineState *seen[8];
+    static int seen_n;
+    int i;
+    for (i = 0; i < seen_n; ++i) {
+        if (seen[i] == s->pso) {
+            return;
+        }
+    }
+    if (seen_n < 8) {
+        seen[seen_n++] = s->pso;
+    }
+    const ViewEntry *c = s->num_rtv ? view_find(s->rtv[0].ptr) : NULL;
+    log_msg("display-pass draw: pso %p vp %.0fx%.0f+%.0f+%.0f rtv %ux%u fmt %d", (void *)s->pso,
+            s->num_vp ? s->vp[0].Width : 0.0f, s->num_vp ? s->vp[0].Height : 0.0f,
+            s->num_vp ? s->vp[0].TopLeftX : 0.0f, s->num_vp ? s->vp[0].TopLeftY : 0.0f,
+            c ? c->width : 0, c ? c->height : 0, c ? (int)c->format : -1);
 }
 
 /* ---------------------------------------------------------------- device hooks */
