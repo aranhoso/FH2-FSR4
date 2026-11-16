@@ -1283,7 +1283,6 @@ static void setup_upscale_chains(void) {
         return;
     }
     done = 1;
-    patch_slot(VT_SLOT(chain_obj[1], IDXGISwapChainVtbl, ResizeBuffers), (void *)hook_ResizeBuffers, (void **)&real_ResizeBuffers);
     IDXGISwapChain3 *sc3 = NULL;
     if (SUCCEEDED(IUnknown_QueryInterface(chain_obj[1], &IID_IDXGISwapChain3, (void **)&sc3))) {
         patch_slot(VT_SLOT(sc3, IDXGISwapChain3Vtbl, ResizeBuffers1), (void *)hook_ResizeBuffers1, (void **)&real_ResizeBuffers1);
@@ -1318,6 +1317,11 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
             chain_obj[chain_count] = (IUnknown *)*sc;
             chain_desc[chain_count] = *desc;
             ++chain_count;
+            /* Patch ResizeBuffers now (pure vtable write, no COM calls in the creation path,
+               before Azimuth's own resize call) so the game chain stays at render res in
+               upscale mode. *sc is already IDXGISwapChain1*, so no QueryInterface here; the
+               IDXGISwapChain3 patch and buffer snapshots happen later, outside creation. */
+            patch_slot(VT_SLOT(*sc, IDXGISwapChainVtbl, ResizeBuffers), (void *)hook_ResizeBuffers, (void **)&real_ResizeBuffers);
         }
         log_msg("swap chain %ux%u format %d buffers %u flags 0x%x hooked (#%d)", desc->Width, desc->Height,
                 (int)desc->Format, desc->BufferCount, desc->Flags, chain_count);
