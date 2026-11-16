@@ -1248,7 +1248,7 @@ static void ensure_hotkey_thread(void) {
    stretches into it itself; we want the game back buffer to stay render-sized so Azimuth's
    game->window display pass does the stretch and we can replace it with FSR. */
 static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers(IDXGISwapChain *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
-    if (g_upscale && rend_w && (UINT64)w * h > (UINT64)rend_w * rend_h) {
+    if (g_upscale && rend_w && sc == (IDXGISwapChain *)chain_obj[1] && (UINT64)w * h > (UINT64)rend_w * rend_h) {
         static int once;
         if (!once) {
             once = 1;
