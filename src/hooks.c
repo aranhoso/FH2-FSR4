@@ -1152,8 +1152,8 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
         real_DrawInstanced(cl, vc, ic, sv, si);
         count_frame();
         setup_upscale_chains();
-        if (scene_ok && !g_upscale) {
-            run_fsr(cl, s);
+        if (scene_ok) {
+            run_fsr(cl, s); /* both modes: native copies back, upscale publishes the HDR output */
         }
         return;
     } else if (role == ROLE_MV && variant && s && s->num_vp) {
