@@ -1021,21 +1021,22 @@ static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *dst = dstv->resource;
     DXGI_FORMAT out_fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : color_fmt;
 
-    /* The display pass's viewport is where the game frame lands on the window back buffer. */
-    UINT out_w = disp_w, out_h = disp_h, dx = 0, dy = 0;
-    if (s->vp[0].Width > 0 && s->vp[0].Height > 0) {
-        out_w = (UINT)s->vp[0].Width;
-        out_h = (UINT)s->vp[0].Height;
-        dx = (UINT)(s->vp[0].TopLeftX > 0 ? s->vp[0].TopLeftX : 0);
-        dy = (UINT)(s->vp[0].TopLeftY > 0 ? s->vp[0].TopLeftY : 0);
-        if (dx + out_w > disp_w) out_w = disp_w - dx;
-        if (dy + out_h > disp_h) out_h = disp_h - dy;
-    }
-    /* Only the frame-stretch draw qualifies: its viewport covers at least the render area. */
-    if ((UINT64)out_w * out_h < (UINT64)rend_w * rend_h) {
+    /* Only the frame blit qualifies: its viewport covers at least the render area
+       (smaller draws into the window back buffer, e.g. UI, are left alone). */
+    if (!s->num_vp || (UINT64)s->vp[0].Width * s->vp[0].Height < (UINT64)rend_w * rend_h) {
         ID3D12Resource_Release(bb);
         return;
     }
+    /* The display pass blits the game frame 1:1 (top-left); we upscale the whole game
+       frame to the render area fitted into the display, centered (pillarbox). */
+    float scale = (float)disp_w / (float)rend_w;
+    if ((float)disp_h / (float)rend_h < scale) {
+        scale = (float)disp_h / (float)rend_h;
+    }
+    UINT out_w = (UINT)(rend_w * scale + 0.5f), out_h = (UINT)(rend_h * scale + 0.5f);
+    if (out_w > disp_w) out_w = disp_w;
+    if (out_h > disp_h) out_h = disp_h;
+    UINT dx = (disp_w - out_w) / 2, dy = (disp_h - out_h) / 2;
 
     ListState saved = *s;
     LONG bb_state = game_bb_state, depth_state = scene_depth_state;
