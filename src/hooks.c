@@ -137,9 +137,6 @@ static UINT rend_w, rend_h;                 /* game chain creation size */
 static int g_upscale;                       /* render < display */
 static ID3D12Resource *window_bb[8];       /* window chain back buffers (raw refs) */
 static UINT window_bb_n;
-static ID3D12Resource *game_bb_cache;
-static volatile LONG game_bb_state = D3D12_RESOURCE_STATE_COMMON;
-static LONG64 game_bb_cache_frame = -1;
 
 /* fh2_fsr.ini next to the DLL: [fsr] mode=auto|native|upscale, hdr=auto|on|off, sharpness, debug_blink */
 static int cfg_mode;                        /* 0 auto, 1 native, 2 upscale */
@@ -170,8 +167,6 @@ static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
 static HRESULT(STDMETHODCALLTYPE *real_CreateSwapChainForHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
-static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
-static HRESULT(STDMETHODCALLTYPE *real_ResizeBuffers1)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
 /* ---------------------------------------------------------------- shaders */
 
@@ -629,8 +624,8 @@ static void STDMETHODCALLTYPE hook_SetGraphicsRootDescriptorTable(ID3D12Graphics
 }
 
 static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
-    ID3D12Resource *color = scene_color, *depth = scene_depth, *bb = game_bb_cache;
-    if (color || depth || bb) {
+    ID3D12Resource *color = scene_color, *depth = scene_depth;
+    if (color || depth) {
         for (UINT i = 0; i < n; ++i) {
             if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
                 continue;
@@ -639,8 +634,6 @@ static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl
                 InterlockedExchange(&scene_color_state, (LONG)b[i].Transition.StateAfter);
             } else if (b[i].Transition.pResource == depth) {
                 InterlockedExchange(&scene_depth_state, (LONG)b[i].Transition.StateAfter);
-            } else if (b[i].Transition.pResource == bb) {
-                InterlockedExchange(&game_bb_state, (LONG)b[i].Transition.StateAfter);
             }
         }
     }
@@ -953,38 +946,11 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     }
 }
 
-/* The game chain's current back buffer (render resolution), refreshed once per frame. */
-static ID3D12Resource *current_game_bb(void) {
-    if (chain_count < 2 || !chain_obj[1]) {
-        return NULL;
-    }
-    if (game_bb_cache && game_bb_cache_frame == present_count) {
-        return game_bb_cache;
-    }
-    IDXGISwapChain3 *sc3 = NULL;
-    if (FAILED(IUnknown_QueryInterface(chain_obj[1], &IID_IDXGISwapChain3, (void **)&sc3))) {
-        return NULL;
-    }
-    UINT i = IDXGISwapChain3_GetCurrentBackBufferIndex(sc3);
-    ID3D12Resource *r = NULL;
-    HRESULT hr = IDXGISwapChain_GetBuffer((IDXGISwapChain *)sc3, i, &IID_ID3D12Resource, (void **)&r);
-    IDXGISwapChain3_Release(sc3);
-    if (FAILED(hr) || !r) {
-        return NULL;
-    }
-    if (game_bb_cache && game_bb_cache_frame != present_count) {
-        ID3D12Resource_Release(game_bb_cache);
-    }
-    game_bb_cache = r;
-    game_bb_cache_frame = present_count;
-    return r;
-}
-
 /* Upscale mode: replace Azimuth's bilinear game->window stretch with FSR. Runs right after
    the display-pass draw (that draw is left intact; its output is overwritten by ours). The
    output covers the draw's viewport, so pillarboxed aspect ratios are preserved. */
 static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
-    if (!g_upscale || !fsr_enabled() || !scene_depth || !mv_tex || !s->win_bb || !s->num_vp || !disp_w) {
+    if (!g_upscale || !fsr_enabled() || !scene_color || !scene_depth || !mv_tex || !s->win_bb || !s->num_vp) {
         return;
     }
     /* debug_blink: alternate 30-frame blocks of FSR / the game's own stretch */
@@ -1005,56 +971,51 @@ static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
         log_msg("FSR fresh motion vectors resumed (upscale)");
     }
 
-    ID3D12Resource *bb = current_game_bb();
-    if (!bb) {
-        return;
-    }
-    D3D12_RESOURCE_DESC bd;
-    bb->lpVtbl->GetDesc(bb, &bd);
-    DXGI_FORMAT color_fmt = bd.Format;
+    D3D12_RESOURCE_DESC cd;
+    scene_color->lpVtbl->GetDesc(scene_color, &cd);
+    UINT rw = (UINT)cd.Width, rh = (UINT)cd.Height;
 
     const ViewEntry *dstv = s->num_rtv ? view_find(s->rtv[0].ptr) : NULL;
     if (!dstv || !dstv->resource) {
-        ID3D12Resource_Release(bb);
         return;
     }
     ID3D12Resource *dst = dstv->resource;
-    DXGI_FORMAT out_fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : color_fmt;
+    UINT dst_w = dstv->width, dst_h = dstv->height;
+    DXGI_FORMAT out_fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : DXGI_FORMAT_R10G10B10A2_UNORM;
 
-    /* Only the frame blit qualifies: its viewport covers at least the render area
-       (smaller draws into the window back buffer, e.g. UI, are left alone). */
-    if (!s->num_vp || (UINT64)s->vp[0].Width * s->vp[0].Height < (UINT64)rend_w * rend_h) {
-        ID3D12Resource_Release(bb);
+    /* Only the present-pass draw qualifies: its viewport covers at least the scene area. */
+    if ((UINT64)s->vp[0].Width * s->vp[0].Height < (UINT64)rw * rh) {
         return;
     }
-    /* The display pass blits the game frame 1:1 (top-left); we upscale the whole game
-       frame to the render area fitted into the display, centered (pillarbox). */
-    float scale = (float)disp_w / (float)rend_w;
-    if ((float)disp_h / (float)rend_h < scale) {
-        scale = (float)disp_h / (float)rend_h;
+    /* Upscale the whole scene into the render area fitted into the game back buffer,
+       centered (pillarbox). */
+    float scale = (float)dst_w / (float)rw;
+    if ((float)dst_h / (float)rh < scale) {
+        scale = (float)dst_h / (float)rh;
     }
-    UINT out_w = (UINT)(rend_w * scale + 0.5f), out_h = (UINT)(rend_h * scale + 0.5f);
-    if (out_w > disp_w) out_w = disp_w;
-    if (out_h > disp_h) out_h = disp_h;
-    UINT dx = (disp_w - out_w) / 2, dy = (disp_h - out_h) / 2;
+    UINT out_w = (UINT)(rw * scale + 0.5f), out_h = (UINT)(rh * scale + 0.5f);
+    if (out_w > dst_w) out_w = dst_w;
+    if (out_h > dst_h) out_h = dst_h;
+    UINT dx = (dst_w - out_w) / 2, dy = (dst_h - out_h) / 2;
 
     ListState saved = *s;
-    LONG bb_state = game_bb_state, depth_state = scene_depth_state;
+    LONG color_state = scene_color_state, depth_state = scene_depth_state;
     AcquireSRWLockShared(&mv_lock);
     if (fallback) {
         clear_mv(cl);
     }
-    int ok = fsr_run(cl, bb, (D3D12_RESOURCE_STATES)bb_state, scene_depth, (D3D12_RESOURCE_STATES)depth_state,
-                     mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, out_w, out_h, out_fmt, color_fmt);
+    int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth, (D3D12_RESOURCE_STATES)depth_state,
+                     mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, out_w, out_h, out_fmt,
+                     DXGI_FORMAT_R11G11B10_FLOAT);
     ID3D12Resource *out = ok ? fsr_output() : NULL;
     if (ok && out) {
         static int once;
         if (!once) {
             once = 1;
-            log_msg("first FSR upscale recorded: render %ux%u fmt %d -> %ux%u at +%u+%u fmt %d",
-                    (UINT)bd.Width, (UINT)bd.Height, (int)color_fmt, out_w, out_h, dx, dy, (int)out_fmt);
+            log_msg("first FSR upscale recorded: render %ux%u fmt 26 -> %ux%u at +%u+%u fmt %d", rw, rh, out_w, out_h,
+                    dx, dy, (int)out_fmt);
         }
-        /* The display-pass draw left the window back buffer in RENDER_TARGET. */
+        /* The present-pass draw left the game back buffer in RENDER_TARGET. */
         transition(cl, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_BOX box = {0, 0, 0, out_w, out_h, 1};
@@ -1070,17 +1031,16 @@ static void run_upscale(ID3D12GraphicsCommandList *cl, ListState *s) {
         transition(cl, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     ReleaseSRWLockShared(&mv_lock);
-    InterlockedExchange(&game_bb_state, bb_state);
+    InterlockedExchange(&scene_color_state, color_state);
     InterlockedExchange(&scene_depth_state, depth_state);
     *s = saved;
     restore_after_fsr(cl, s);
-    ID3D12Resource_Release(bb);
     fsr_end_frame((!fallback && ok) ? 1 : 0);
     static LONG up_count;
     LONG n = InterlockedIncrement(&up_count);
     if (ok && (n == 1 || n % 600 == 0)) {
-        log_msg("FSR upscale frame %ld (render %ux%u -> %ux%u at +%u+%u)", n, (UINT)bd.Width, (UINT)bd.Height, out_w,
-                out_h, dx, dy);
+        log_msg("FSR upscale frame %ld (render %ux%u fmt 26 -> %ux%u at +%u+%u fmt %d)", n, rw, rh, out_w, out_h, dx, dy,
+                (int)out_fmt);
     }
 }
 
@@ -1245,38 +1205,8 @@ static void ensure_hotkey_thread(void) {
 
 /* ---------------------------------------------------------------- swap chains */
 
-/* Keep the game chain at render resolution: Azimuth resizes it to display res so the game
-   stretches into it itself; we want the game back buffer to stay render-sized so Azimuth's
-   game->window display pass does the stretch and we can replace it with FSR. */
-static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers(IDXGISwapChain *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
-    if (g_upscale && rend_w && sc == (IDXGISwapChain *)chain_obj[1] && (UINT64)w * h > (UINT64)rend_w * rend_h) {
-        static int once;
-        if (!once) {
-            once = 1;
-            log_msg("game chain ResizeBuffers %ux%u clamped to render %ux%u", w, h, rend_w, rend_h);
-        }
-        w = rend_w;
-        h = rend_h;
-    }
-    return real_ResizeBuffers(sc, n, w, h, f, fl);
-}
-
-static HRESULT STDMETHODCALLTYPE hook_ResizeBuffers1(IDXGISwapChain3 *sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl,
-                                                     const UINT *mask, IUnknown *const *queues) {
-    if (g_upscale && rend_w && (UINT64)w * h > (UINT64)rend_w * rend_h) {
-        static int once;
-        if (!once) {
-            once = 1;
-            log_msg("game chain ResizeBuffers1 %ux%u clamped to render %ux%u", w, h, rend_w, rend_h);
-        }
-        w = rend_w;
-        h = rend_h;
-    }
-    return real_ResizeBuffers1(sc, n, w, h, f, fl, mask, queues);
-}
-
-/* Called once both chains exist and the mode is resolved: patch the game chain's
-   ResizeBuffers and snapshot the window chain's back buffers. Runs on a render thread,
+/* Called once both chains exist and the mode is resolved: snapshot the game chain's
+   back buffers (the game's present pass draws into them). Runs on a render thread,
    never inside the factory creation path. */
 static void setup_upscale_chains(void) {
     static int done;
@@ -1284,24 +1214,19 @@ static void setup_upscale_chains(void) {
         return;
     }
     done = 1;
-    IDXGISwapChain3 *sc3 = NULL;
-    if (SUCCEEDED(IUnknown_QueryInterface(chain_obj[1], &IID_IDXGISwapChain3, (void **)&sc3))) {
-        patch_slot(VT_SLOT(sc3, IDXGISwapChain3Vtbl, ResizeBuffers1), (void *)hook_ResizeBuffers1, (void **)&real_ResizeBuffers1);
-        IDXGISwapChain3_Release(sc3);
-    }
-    UINT n = chain_desc[0].BufferCount;
+    UINT n = chain_desc[1].BufferCount;
     if (n > 8) {
         n = 8;
     }
     for (UINT i = 0; i < n; ++i) {
         ID3D12Resource *r = NULL;
-        if (SUCCEEDED(IDXGISwapChain_GetBuffer((IDXGISwapChain *)chain_obj[0], i, &IID_ID3D12Resource, (void **)&r)) && r) {
+        if (SUCCEEDED(IDXGISwapChain_GetBuffer((IDXGISwapChain *)chain_obj[1], i, &IID_ID3D12Resource, (void **)&r)) && r) {
             window_bb[window_bb_n++] = r; /* raw ref kept; the chain owns the buffers */
             ID3D12Resource_Release(r);
         }
     }
-    log_msg("upscale setup: game chain ResizeBuffers clamped to %ux%u, %u window back buffers cached", rend_w, rend_h,
-            window_bb_n);
+    log_msg("upscale setup: %u game-chain back buffers cached (render %ux%u, display %ux%u)", window_bb_n, rend_w, rend_h,
+            disp_w, disp_h);
 }
 
 /* No Present hooks here (Steam overlay double-hook crash; multiple swap chains in 1.x).
@@ -1318,11 +1243,6 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
             chain_obj[chain_count] = (IUnknown *)*sc;
             chain_desc[chain_count] = *desc;
             ++chain_count;
-            /* Patch ResizeBuffers now (pure vtable write, no COM calls in the creation path,
-               before Azimuth's own resize call) so the game chain stays at render res in
-               upscale mode. *sc is already IDXGISwapChain1*, so no QueryInterface here; the
-               IDXGISwapChain3 patch and buffer snapshots happen later, outside creation. */
-            patch_slot(VT_SLOT(*sc, IDXGISwapChainVtbl, ResizeBuffers), (void *)hook_ResizeBuffers, (void **)&real_ResizeBuffers);
         }
         log_msg("swap chain %ux%u format %d buffers %u flags 0x%x hooked (#%d)", desc->Width, desc->Height,
                 (int)desc->Format, desc->BufferCount, desc->Flags, chain_count);
