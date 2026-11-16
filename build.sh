@@ -5,7 +5,7 @@
 # The AMD FSR API headers and DLLs come from the official FSR SDK v2.3.0 (FSR Upscaling 4.1.1).
 set -e
 cd "$(dirname "$0")"
-VERSION=0.2.0
+VERSION=0.3.0
 SDK_TAG=v2.3.0
 ZIG=${ZIG:-zig}
 
