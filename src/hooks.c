@@ -1128,6 +1128,16 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
                         break;
                     }
                 }
+                /* The game re-creates the scene SRV at fresh handles each frame and binds the
+                   present pass through copies, so cached handles go stale. The frame texture is
+                   at the start of the blit's table: blind-overwrite the first slots too. */
+                for (UINT k = 0; k < 4; ++k) {
+                    SIZE_T h = base + (SIZE_T)k * g_srv_inc;
+                    D3D12_CPU_DESCRIPTOR_HANDLE ch;
+                    ch.ptr = h;
+                    ID3D12Device_CreateShaderResourceView(g_device, up, NULL, ch);
+                    ++redirected;
+                }
             }
         }
     }
