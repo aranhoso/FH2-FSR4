@@ -139,8 +139,6 @@ static UINT disp_w, disp_h;                 /* window chain size */
 static UINT scene_w, scene_h;               /* render size, from the scene colour */
 static ID3D12Resource *volatile g_upscale_tex;
 static D3D12_GPU_DESCRIPTOR_HANDLE g_up_gpu;
-static SIZE_T scene_srv[16];
-static int scene_srv_n;
 static UINT rend_w, rend_h;                 /* game chain creation size */
 static int g_upscale;                       /* render < display */
 static ID3D12Resource *window_bb[8];       /* window chain back buffers (raw refs) */
@@ -1031,43 +1029,15 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     }
 }
 
-/* A descriptor is "the scene" if it is an SRV on a render-sized HDR (R11G11B10) texture. */
-static int is_scene_srv(const ViewEntry *e) {
-    return e && e->kind == 3 && e->resource && e->format == DXGI_FORMAT_R11G11B10_FLOAT &&
-           e->width == scene_w && e->height == scene_h;
-}
-
-static void overwrite_scene_srv(ID3D12Resource *up, SIZE_T cpu_handle) {
-    const ViewEntry *e = view_find(cpu_handle);
-    if (!is_scene_srv(e) || !g_device) {
-        return;
-    }
-    D3D12_SHADER_RESOURCE_VIEW_DESC d = e->srv_desc;
-    if (d.Format == DXGI_FORMAT_UNKNOWN) {
-        D3D12_RESOURCE_DESC ud;
-        up->lpVtbl->GetDesc(up, &ud);
-        d.Format = ud.Format;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    h.ptr = cpu_handle;
-    ID3D12Device_CreateShaderResourceView(g_device, up, &d, h);
-}
 
 /* Collect the scene's SRV handles and make our heap slot 0 the FSR output's SRV. */
 static void publish_upscale_tex(ID3D12Resource *up) {
+    /* Only publish our own copy: never touch the game's descriptors (that crashes
+       amdxc64 / corrupts the present pass). The tonemap pass samples slot 0 of
+       srv_heap directly. */
     g_upscale_tex = up;
-    scene_srv_n = 0;
     if (!up || !g_device) {
         return;
-    }
-    for (UINT i = 0; i < MAX_VIEWS; ++i) {
-        ViewEntry *e = &views[i];
-        if (e->handle && is_scene_srv(e) && scene_srv_n < 16) {
-            scene_srv[scene_srv_n++] = e->handle;
-        }
-    }
-    for (int i = 0; i < scene_srv_n; ++i) {
-        overwrite_scene_srv(up, scene_srv[i]);
     }
     if (ensure_heaps()) {
         D3D12_CPU_DESCRIPTOR_HANDLE c = cpu_handle(srv_heap, 0, g_srv_inc);
@@ -1078,8 +1048,8 @@ static void publish_upscale_tex(ID3D12Resource *up) {
     if (InterlockedIncrement(&pub) == 1) {
         D3D12_RESOURCE_DESC ud;
         up->lpVtbl->GetDesc(up, &ud);
-        log_msg("upscale output %p %ux%u fmt %d flags 0x%x, %d scene SRV handle(s) cached", (void *)up, (UINT)ud.Width,
-                (UINT)ud.Height, (int)ud.Format, (unsigned)ud.Flags, scene_srv_n);
+        log_msg("upscale output %p %ux%u fmt %d flags 0x%x", (void *)up, (UINT)ud.Width, (UINT)ud.Height,
+                (int)ud.Format, (unsigned)ud.Flags);
     }
 }
 
