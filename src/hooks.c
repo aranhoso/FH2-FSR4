@@ -1173,7 +1173,7 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(cl, 0, g_up_gpu);
     UINT rw = g_upscale_tex ? (UINT)({ D3D12_RESOURCE_DESC d; g_upscale_tex->lpVtbl->GetDesc(g_upscale_tex, &d); d.Width; }) : 1;
     UINT rh = g_upscale_tex ? (UINT)({ D3D12_RESOURCE_DESC d; g_upscale_tex->lpVtbl->GetDesc(g_upscale_tex, &d); d.Height; }) : 1;
-    UINT hdr_mode = cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u);
+    UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u));
     float consts[3] = {(float)hdr_mode, 1.0f / (float)rw, 1.0f / (float)rh};
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 3, consts, 0);
     real_SetPipelineState(cl, tm_pso);
