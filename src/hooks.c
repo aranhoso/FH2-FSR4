@@ -644,18 +644,6 @@ static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList 
     }
 }
 
-static SIZE_T gpu_to_cpu(ListState *s, D3D12_GPU_DESCRIPTOR_HANDLE g) {
-    for (UINT i = 0; i < s->num_heaps; ++i) {
-        if (!s->heap_gpu[i].ptr || !g_srv_inc) {
-            continue;
-        }
-        UINT64 base = s->heap_gpu[i].ptr, span = (UINT64)s->heap_num[i] * g_srv_inc;
-        if (g.ptr >= base && g.ptr < base + span) {
-            return s->heap_cpu[i].ptr + (g.ptr - base);
-        }
-    }
-    return 0;
-}
 
 static void STDMETHODCALLTYPE hook_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList *cl, UINT index,
                                                                     D3D12_GPU_DESCRIPTOR_HANDLE h) {
@@ -1091,62 +1079,137 @@ static void publish_upscale_tex(ID3D12Resource *up) {
     }
 }
 
-/* Before a draw into a game back buffer (the present pass), point every binding that
-   references the scene colour at the FSR output, so the game's own tonemap/present
-   shader processes the upscaled HDR image. */
-static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s) {
-    ID3D12Resource *up = g_upscale_tex;
-    if (!g_upscale || !up || !scene_w) {
-        return;
+
+
+/* ---------------------------------------------------------------- tonemap pass */
+/* In upscale mode we never touch the game's descriptors (that crashes AMD's amdxc64 shim).
+   Instead, right after the game's present-pass draw, we draw our own fullscreen pass that
+   samples the FSR output (HDR, display-fitted) and tonemaps it into the back buffer. */
+static ID3D12RootSignature *tm_root;
+static ID3D12PipelineState *tm_pso;
+static DXGI_FORMAT tm_pso_fmt = DXGI_FORMAT_UNKNOWN;
+
+static int ensure_tonemap(DXGI_FORMAT fmt) {
+    if (!g_device) {
+        return 0;
     }
-    static LONG red_frames;
-    LONG n = InterlockedIncrement(&red_frames);
-    int redirected = 0;
-    for (int i = 0; i < scene_srv_n; ++i) {
-        if (is_scene_srv(view_find(scene_srv[i]))) {
-            overwrite_scene_srv(up, scene_srv[i]);
-            ++redirected;
+    if (tm_root && tm_pso && tm_pso_fmt == fmt) {
+        return 1;
+    }
+    if (!tm_root) {
+        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+        D3D12_ROOT_PARAMETER param[2];
+        memset(param, 0, sizeof(param));
+        param[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param[0].DescriptorTable.NumDescriptorRanges = 1;
+        param[0].DescriptorTable.pDescriptorRanges = &range;
+        param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        param[1].Constants.ShaderRegister = 0;
+        param[1].Constants.Num32BitValues = 1;
+        param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC smp;
+        memset(&smp, 0, sizeof(smp));
+        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        smp.ShaderRegister = 0;
+        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rs;
+        memset(&rs, 0, sizeof(rs));
+        rs.NumParameters = 2;
+        rs.pParameters = param;
+        rs.NumStaticSamplers = 1;
+        rs.pStaticSamplers = &smp;
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        typedef HRESULT(WINAPI * PFN_Ser)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
+        PFN_Ser ser = (PFN_Ser)(void *)GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature");
+        ID3DBlob *blob = NULL, *err = NULL;
+        if (!ser || FAILED(ser(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
+            log_msg("tonemap root signature serialization failed");
+            return 0;
+        }
+        HRESULT hr = ID3D12Device_CreateRootSignature(g_device, 0, ID3D10Blob_GetBufferPointer(blob),
+                                                      ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature,
+                                                      (void **)&tm_root);
+        ID3D10Blob_Release(blob);
+        if (FAILED(hr)) {
+            return 0;
         }
     }
-    for (UINT i = 0; i < 32; ++i) {
-        if (s->root_srv_mask & (1u << i)) {
-            SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i]);
-            if (cpu && is_scene_srv(view_find(cpu))) {
-                real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
-                ++redirected;
-            }
-        }
-        if (s->tables_mask & (1u << i)) {
-            SIZE_T base = gpu_to_cpu(s, s->tables[i]);
-            if (base && g_srv_inc) {
-                for (UINT k = 0; k < 64; ++k) {
-                    SIZE_T h = base + (SIZE_T)k * g_srv_inc;
-                    if (is_scene_srv(view_find(h))) {
-                        overwrite_scene_srv(up, h);
-                        ++redirected;
-                    } else if (!view_find(h)) {
-                        break;
-                    }
-                }
-                /* The game re-creates the scene SRV at fresh handles each frame and binds the
-                   present pass through copies, so cached handles go stale. The frame texture is
-                   at the start of the blit's table: blind-overwrite the first slots too. */
-                for (UINT k = 0; k < 4; ++k) {
-                    SIZE_T h = base + (SIZE_T)k * g_srv_inc;
-                    D3D12_CPU_DESCRIPTOR_HANDLE ch;
-                    ch.ptr = h;
-                    ID3D12Device_CreateShaderResourceView(g_device, up, NULL, ch);
-                    ++redirected;
-                }
-            }
-        }
+    ID3DBlob *vs = compile(TONEMAP_HLSL, "vs", "vs_5_0"), *ps = compile(TONEMAP_HLSL, "ps", "ps_5_0");
+    if (!vs || !ps) {
+        return 0;
     }
-    if (n == 1 || n % 600 == 0) {
-        log_msg("present-pass redirect frame %ld: %d scene binding(s) re-pointed, %d cached handles", n, redirected,
-                scene_srv_n);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
+    memset(&d, 0, sizeof(d));
+    d.pRootSignature = tm_root;
+    d.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs);
+    d.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+    d.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
+    d.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.SampleMask = UINT_MAX;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.NumRenderTargets = 1;
+    d.RTVFormats[0] = fmt;
+    d.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso = NULL;
+    HRESULT hr = real_CreateGraphicsPipelineState(g_device, &d, &IID_ID3D12PipelineState, (void **)&pso);
+    ID3D10Blob_Release(vs);
+    ID3D10Blob_Release(ps);
+    if (FAILED(hr) || !pso) {
+        log_msg("tonemap PSO failed 0x%08lx (fmt %d)", hr, (int)fmt);
+        return 0;
     }
+    tm_pso = pso;
+    tm_pso_fmt = fmt;
+    log_msg("tonemap pass ready (fmt %d)", (int)fmt);
+    return 1;
 }
 
+static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
+    if (!g_upscale || !fsr_enabled() || !g_upscale_tex || !s->num_rtv) {
+        return;
+    }
+    if (cfg_debug_blink) {
+        static LONG bc;
+        if ((InterlockedIncrement(&bc) / 30) % 2 == 1) {
+            return;
+        }
+    }
+    const ViewEntry *dstv = view_find(s->rtv[0].ptr);
+    if (!dstv || !dstv->resource || !ensure_heaps()) {
+        return;
+    }
+    DXGI_FORMAT fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (!ensure_tonemap(fmt)) {
+        return;
+    }
+    ListState saved = *s;
+    ID3D12DescriptorHeap *heap = srv_heap;
+    real_SetDescriptorHeaps(cl, 1, &heap);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, tm_root);
+    ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(cl, 0, g_up_gpu);
+    UINT hdr_mode = cfg_hdr ? 1u : 0u;
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 1, &hdr_mode, 0);
+    real_SetPipelineState(cl, tm_pso);
+    real_OMSetRenderTargets(cl, 1, &s->rtv[0], TRUE, NULL);
+    D3D12_VIEWPORT vp = {0, 0, (float)dstv->width, (float)dstv->height, 0, 1};
+    D3D12_RECT sc = {0, 0, (LONG)dstv->width, (LONG)dstv->height};
+    real_RSSetViewports(cl, 1, &vp);
+    real_RSSetScissorRects(cl, 1, &sc);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    real_DrawInstanced(cl, 3, 1, 0, 0);
+    *s = saved;
+    restore_after_fsr(cl, s);
+    static LONG tm_frames;
+    LONG n = InterlockedIncrement(&tm_frames);
+    if (n == 1 || n % 600 == 0) {
+        log_msg("tonemap pass frame %ld (%ux%u fmt %d)", n, dstv->width, dstv->height, (int)fmt);
+    }
+}
 
 /* Log each distinct PSO that draws into a window back buffer (the display pass), once. */
 static void diag_display_draw(ListState *s) {
@@ -1168,6 +1231,7 @@ static void diag_display_draw(ListState *s) {
 }
 
 static void setup_upscale_chains(void);
+static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s);
 
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
@@ -1185,11 +1249,11 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
     } else if (role == ROLE_MV && variant && s && s->num_vp) {
         record_mv_pass(cl, s, variant, vc, ic, sv, si);
     }
+    real_DrawInstanced(cl, vc, ic, sv, si);
     if (s && s->win_bb) {
         diag_display_draw(s);
-        redirect_scene_bindings(cl, s);
+        run_tonemap(cl, s);
     }
-    real_DrawInstanced(cl, vc, ic, sv, si);
 }
 
 static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *cl, UINT index_count,
@@ -1204,11 +1268,11 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
     } else if (role == ROLE_MV && variant && s && s->num_vp) {
         record_mv_pass_indexed(cl, s, variant, index_count, instance_count, start_index, base_vertex, start_instance);
     }
+    real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
     if (s && s->win_bb) {
         diag_display_draw(s);
-        redirect_scene_bindings(cl, s);
+        run_tonemap(cl, s);
     }
-    real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
 }
 
 /* ---------------------------------------------------------------- device hooks */
