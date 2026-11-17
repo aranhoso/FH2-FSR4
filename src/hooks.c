@@ -1523,9 +1523,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         GetPrivateProfileStringW(L"fsr", L"sharpness", L"-1", v, 64, ini);
         cfg_sharpness = (float)_wtof(v);
         GetPrivateProfileStringW(L"fsr", L"debug_blink", L"0", v, 64, ini);
+        cfg_debug_blink = _wtoi(v);
         GetPrivateProfileStringW(L"fsr", L"debug_raw", L"0", v, 64, ini);
         cfg_debug_raw = _wtoi(v);
-        cfg_debug_blink = _wtoi(v);
         fsr_config(cfg_hdr >= 0 ? cfg_hdr : 1, cfg_sharpness);
         log_msg("config: mode=%d hdr=%d sharpness=%.2f debug_blink=%d", cfg_mode, cfg_hdr, cfg_sharpness, cfg_debug_blink);
 
