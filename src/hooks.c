@@ -1085,6 +1085,10 @@ static void publish_upscale_tex(ID3D12Resource *up) {
         ID3D12Device_CreateShaderResourceView(g_device, up, NULL, c);
         srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
     }
+    static LONG pub;
+    if (InterlockedIncrement(&pub) == 1) {
+        log_msg("upscale output published: %d scene SRV handle(s) cached", scene_srv_n);
+    }
 }
 
 /* Before a draw into a game back buffer (the present pass), point every binding that
@@ -1095,14 +1099,21 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
     if (!g_upscale || !up || !scene_w) {
         return;
     }
+    static LONG red_frames;
+    LONG n = InterlockedIncrement(&red_frames);
+    int redirected = 0;
     for (int i = 0; i < scene_srv_n; ++i) {
-        overwrite_scene_srv(up, scene_srv[i]);
+        if (is_scene_srv(view_find(scene_srv[i]))) {
+            overwrite_scene_srv(up, scene_srv[i]);
+            ++redirected;
+        }
     }
     for (UINT i = 0; i < 32; ++i) {
         if (s->root_srv_mask & (1u << i)) {
             SIZE_T cpu = gpu_to_cpu(s, s->root_srv[i]);
             if (cpu && is_scene_srv(view_find(cpu))) {
                 real_SetGraphicsRootShaderResourceView(cl, i, g_up_gpu);
+                ++redirected;
             }
         }
         if (s->tables_mask & (1u << i)) {
@@ -1112,12 +1123,17 @@ static void redirect_scene_bindings(ID3D12GraphicsCommandList *cl, ListState *s)
                     SIZE_T h = base + (SIZE_T)k * g_srv_inc;
                     if (is_scene_srv(view_find(h))) {
                         overwrite_scene_srv(up, h);
+                        ++redirected;
                     } else if (!view_find(h)) {
                         break;
                     }
                 }
             }
         }
+    }
+    if (n == 1 || n % 600 == 0) {
+        log_msg("present-pass redirect frame %ld: %d scene binding(s) re-pointed, %d cached handles", n, redirected,
+                scene_srv_n);
     }
 }
 
