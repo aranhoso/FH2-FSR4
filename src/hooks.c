@@ -1185,6 +1185,8 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
         return;
     }
     ListState saved = *s;
+    ID3D12Resource *up = g_upscale_tex;
+    transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ID3D12DescriptorHeap *heap = srv_heap;
     real_SetDescriptorHeaps(cl, 1, &heap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, tm_root);
@@ -1201,6 +1203,7 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_RSSetScissorRects(cl, 1, &sc);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     real_DrawInstanced(cl, 3, 1, 0, 0);
+    transition(cl, up, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     *s = saved;
     restore_after_fsr(cl, s);
     static LONG tm_frames;
