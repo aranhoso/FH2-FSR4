@@ -48,6 +48,7 @@ static const char TONEMAP_HLSL[] =
     "float4 ps(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
     "    int2 p = int2(pos.xy);\n"
     "    float3 c = hdr.Load(int3(p, 0));\n"
+    "    if (hdr_mode == 2u) { return float4(c, 1.0); }\n"
     "    c = 1.0 - exp(-c * 2.0);\n"
     "    if (hdr_mode != 0u) { return float4(pq(c), 1.0); }\n"
     "    return float4(pow(c, 1.0 / 2.2), 1.0);\n"
