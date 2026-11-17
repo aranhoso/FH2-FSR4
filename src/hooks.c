@@ -1090,6 +1090,10 @@ static ID3D12PipelineState *tm_pso;
 static DXGI_FORMAT tm_pso_fmt = DXGI_FORMAT_UNKNOWN;
 
 static int ensure_tonemap(DXGI_FORMAT fmt) {
+    static int tm_failed;
+    if (tm_failed) {
+        return 0;
+    }
     if (!g_device) {
         return 0;
     }
@@ -1106,20 +1110,12 @@ static int ensure_tonemap(DXGI_FORMAT fmt) {
         param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param[1].Constants.ShaderRegister = 0;
-        param[1].Constants.Num32BitValues = 1;
+        param[1].Constants.Num32BitValues = 3;
         param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_STATIC_SAMPLER_DESC smp;
-        memset(&smp, 0, sizeof(smp));
-        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        smp.ShaderRegister = 0;
-        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rs;
         memset(&rs, 0, sizeof(rs));
         rs.NumParameters = 2;
         rs.pParameters = param;
-        rs.NumStaticSamplers = 1;
-        rs.pStaticSamplers = &smp;
         rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         typedef HRESULT(WINAPI * PFN_Ser)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
         PFN_Ser ser = (PFN_Ser)(void *)GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "D3D12SerializeRootSignature");
@@ -1160,7 +1156,8 @@ static int ensure_tonemap(DXGI_FORMAT fmt) {
     ID3D10Blob_Release(vs);
     ID3D10Blob_Release(ps);
     if (FAILED(hr) || !pso) {
-        log_msg("tonemap PSO failed 0x%08lx (fmt %d)", hr, (int)fmt);
+        tm_failed = 1;
+        log_msg("tonemap PSO failed 0x%08lx (fmt %d); disabling tonemap pass", hr, (int)fmt);
         return 0;
     }
     tm_pso = pso;
@@ -1192,8 +1189,10 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_SetDescriptorHeaps(cl, 1, &heap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, tm_root);
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(cl, 0, g_up_gpu);
-    UINT hdr_mode = cfg_hdr ? 1u : 0u;
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 1, &hdr_mode, 0);
+    UINT rw = g_upscale_tex ? (UINT)({ D3D12_RESOURCE_DESC d; g_upscale_tex->lpVtbl->GetDesc(g_upscale_tex, &d); d.Width; }) : 1;
+    UINT rh = g_upscale_tex ? (UINT)({ D3D12_RESOURCE_DESC d; g_upscale_tex->lpVtbl->GetDesc(g_upscale_tex, &d); d.Height; }) : 1;
+    float consts[3] = {(float)(cfg_hdr ? 1u : 0u), 1.0f / (float)rw, 1.0f / (float)rh};
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 3, consts, 0);
     real_SetPipelineState(cl, tm_pso);
     real_OMSetRenderTargets(cl, 1, &s->rtv[0], TRUE, NULL);
     D3D12_VIEWPORT vp = {0, 0, (float)dstv->width, (float)dstv->height, 0, 1};

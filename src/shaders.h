@@ -29,24 +29,25 @@ static const char MV_PS_HLSL[] =
     "    return float4(m.x * 0.5, -m.y * 0.5, 0, 0);\n"
     "}\n";
 
-/* Fullscreen tonemap pass used in upscale mode: samples the FSR output (HDR) and writes the
-   tonemapped image into the back buffer. hdr_mode selects PQ (ST.2084) vs sRGB output. */
+/* Fullscreen tonemap pass used in upscale mode: point-samples the FSR output (HDR) and writes
+   the tonemapped image into the back buffer. cbuffer: hdr_mode, texel.xy. */
 static const char TONEMAP_HLSL[] =
     "Texture2D<float3> hdr : register(t0);\n"
-    "SamplerState smp : register(s0);\n"
-    "cbuffer C : register(b0) { uint hdr_mode; };\n"
+    "cbuffer C : register(b0) { uint hdr_mode; float2 texel; };\n"
     "float3 pq(float3 c) {\n"
     "    c = max(c, 0.0);\n"
     "    float m1 = 0.159301758125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
     "    float3 p = pow(c, float3(m2, m2, m2));\n"
     "    return pow((c1 + c2 * p) / (1.0 + c3 * p), float3(m1, m1, m1));\n"
     "}\n"
-    "float4 vs(uint id : SV_VertexID) : SV_POSITION {\n"
+    "void vs(uint id : SV_VertexID, out float4 pos : SV_POSITION, out float2 uv : TEXCOORD0) {\n"
     "    float2 t = float2((id << 1) & 2, id & 2);\n"
-    "    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "    uv = t;\n"
+    "    pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "}\n"
     "float4 ps(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
-    "    float3 c = hdr.Sample(smp, uv);\n"
+    "    int2 p = int2(pos.xy);\n"
+    "    float3 c = hdr.Load(int3(p, 0));\n"
     "    c = 1.0 - exp(-c * 2.0);\n"
     "    if (hdr_mode != 0u) { return float4(pq(c), 1.0); }\n"
     "    return float4(pow(c, 1.0 / 2.2), 1.0);\n"
