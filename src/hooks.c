@@ -137,6 +137,7 @@ static DXGI_SWAP_CHAIN_DESC1 chain_desc[2];
 static int chain_count;
 static UINT disp_w, disp_h;                 /* window chain size */
 static UINT scene_w, scene_h;               /* render size, from the scene colour */
+static D3D12_GPU_DESCRIPTOR_HANDLE g_up_gpu;     /* srv_heap slot 0: FSR output SRV */
 static D3D12_GPU_DESCRIPTOR_HANDLE g_scene_gpu;  /* srv_heap slot 2: scene colour SRV (control) */
 static UINT rend_w, rend_h;                 /* game chain creation size */
 static int g_upscale;                       /* render < display */
@@ -1102,54 +1103,6 @@ static int ensure_tonemap(DXGI_FORMAT fmt) {
     return 1;
 }
 
-static ID3D12Resource *g_stage_tex;   /* copy of the FSR output, state managed at the present draw */
-static UINT g_stage_w, g_stage_h;
-static D3D12_GPU_DESCRIPTOR_HANDLE g_stage_gpu;
-
-static int ensure_stage(ID3D12GraphicsCommandList *cl, UINT w, UINT h) {
-    if (g_stage_tex && g_stage_w == w && g_stage_h == h) {
-        return 1;
-    }
-    if (!g_device || !ensure_heaps()) {
-        return 0;
-    }
-    if (g_stage_tex) {
-        g_stage_tex = NULL; /* leaked on purpose if referenced in flight */
-        g_stage_w = g_stage_h = 0;
-    }
-    D3D12_HEAP_PROPERTIES hp;
-    memset(&hp, 0, sizeof(hp));
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd;
-    memset(&rd, 0, sizeof(rd));
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-    rd.SampleDesc.Count = 1;
-    if (FAILED(ID3D12Device_CreateCommittedResource(g_device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
-                                                    &IID_ID3D12Resource, (void **)&g_stage_tex))) {
-        g_stage_tex = NULL;
-        return 0;
-    }
-    ID3D12Resource_SetName(g_stage_tex, L"FH2FSR Stage");
-    D3D12_SHADER_RESOURCE_VIEW_DESC sd;
-    memset(&sd, 0, sizeof(sd));
-    sd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels = 1;
-    ID3D12Device_CreateShaderResourceView(g_device, g_stage_tex, &sd, cpu_handle(srv_heap, 1, g_srv_inc));
-    D3D12_GPU_DESCRIPTOR_HANDLE g0;
-    srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g0);
-    g_stage_gpu.ptr = g0.ptr + g_srv_inc;
-    g_stage_w = w;
-    g_stage_h = h;
-    log_msg("tonemap stage %ux%u ready", w, h);
-    return 1;
-}
 
 static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (!g_upscale || !fsr_enabled() || !scene_color || !scene_depth || !mv_tex || !s->num_rtv) {
@@ -1205,21 +1158,14 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *up = fsr_output();
     D3D12_RESOURCE_DESC ud;
     up->lpVtbl->GetDesc(up, &ud);
-    if (!ensure_stage(cl, (UINT)ud.Width, (UINT)ud.Height)) {
-        fsr_end_frame(1);
-        return;
+    if (ensure_heaps()) {
+        ID3D12Device_CreateShaderResourceView(g_device, up, NULL, cpu_handle(srv_heap, 0, g_srv_inc));
+        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
     }
-    /* Copy the FSR output into the staging texture here, on the present list (the same
-       pattern that was stable for the copy-over path): out UAV->COPY_SOURCE, stage
-       PSR->COPY_DEST->PSR, out back to UAV. */
-    transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(cl, g_stage_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->lpVtbl->CopyResource(cl, g_stage_tex, up);
-    transition(cl, g_stage_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    transition(cl, up, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u)));
-    D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_stage_gpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_up_gpu;
 
     ListState saved = *s;
     ID3D12DescriptorHeap *heap = srv_heap;
@@ -1239,6 +1185,7 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_RSSetScissorRects(cl, 1, &sc);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     real_DrawInstanced(cl, 3, 1, 0, 0);
+    transition(cl, up, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     *s = saved;
     restore_after_fsr(cl, s);
     fsr_end_frame(1);
