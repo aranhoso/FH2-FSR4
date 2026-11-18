@@ -150,6 +150,7 @@ static int cfg_hdr = -1;                    /* -1 auto, 0 off, 1 on */
 static float cfg_sharpness = -1.0f;
 static int cfg_debug_blink;
 static int cfg_debug_raw;
+static float cfg_exposure = 1.0f;   /* tonemap exposure multiplier (fh2_fsr.ini) */
 
 /* ---------------------------------------------------------------- originals */
 
@@ -1092,7 +1093,7 @@ static int ensure_tonemap(DXGI_FORMAT fmt) {
         param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param[1].Constants.ShaderRegister = 0;
-        param[1].Constants.Num32BitValues = 3;
+        param[1].Constants.Num32BitValues = 4;
         param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         D3D12_ROOT_SIGNATURE_DESC rs;
         memset(&rs, 0, sizeof(rs));
@@ -1270,11 +1271,12 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_SetDescriptorHeaps(cl, 1, &heap);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(cl, tm_root);
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(cl, 0, tbl);
-    float consts[3];
+    float consts[4];
     memcpy(&consts[0], &hdr_mode, 4);
     consts[1] = 1.0f / (float)ud.Width;
     consts[2] = 1.0f / (float)ud.Height;
-    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 3, consts, 0);
+    consts[3] = cfg_exposure;
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 4, consts, 0);
     real_SetPipelineState(cl, tm_pso);
     real_OMSetRenderTargets(cl, 1, &s->rtv[0], TRUE, NULL);
     D3D12_VIEWPORT vp = {0, 0, (float)bb_w, (float)bb_h, 0, 1};
@@ -1630,8 +1632,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         cfg_debug_blink = _wtoi(v);
         GetPrivateProfileStringW(L"fsr", L"debug_raw", L"0", v, 64, ini);
         cfg_debug_raw = _wtoi(v);
+        GetPrivateProfileStringW(L"fsr", L"exposure", L"1.0", v, 64, ini);
+        cfg_exposure = (float)_wtof(v);
+        if (cfg_exposure <= 0.0f) cfg_exposure = 1.0f;
         fsr_config(cfg_hdr >= 0 ? cfg_hdr : 1, cfg_sharpness);
-        log_msg("config: mode=%d hdr=%d sharpness=%.2f debug_blink=%d", cfg_mode, cfg_hdr, cfg_sharpness, cfg_debug_blink);
+        log_msg("config: mode=%d hdr=%d sharpness=%.2f debug_blink=%d debug_raw=%d exposure=%.2f", cfg_mode, cfg_hdr,
+                cfg_sharpness, cfg_debug_blink, cfg_debug_raw, cfg_exposure);
 
         log_msg(patch_exe_import() ? "D3D12CreateDevice import patched" : "D3D12CreateDevice import NOT found");
     }

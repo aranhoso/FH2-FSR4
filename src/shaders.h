@@ -33,7 +33,7 @@ static const char MV_PS_HLSL[] =
    the tonemapped image into the back buffer. cbuffer: hdr_mode, texel.xy. */
 static const char TONEMAP_HLSL[] =
     "Texture2D<float3> hdr : register(t0);\n"
-    "cbuffer C : register(b0) { uint hdr_mode; float2 texel; };\n"
+    "cbuffer C : register(b0) { uint hdr_mode; float2 texel; float exposure; };\n"
     "float3 pq(float3 c) {\n"
     "    const float m1 = 0.159301758125, m2 = 78.84375;\n"
     "    const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
@@ -51,7 +51,6 @@ static const char TONEMAP_HLSL[] =
     "    if (hdr_mode == 6u) { return float4(c * 0.001, 1.0); }\n"
     "    if (hdr_mode == 2u) { return float4(c, 1.0); }\n"
     "    if (hdr_mode == 3u) { return float4(1, 0, 1, 1); }\n"
-    "    c = 1.0 - exp(-c * 2.0);\n"
-    "    if (hdr_mode != 0u) { return float4(pq(c * 0.02), 1.0); }\n"
-    "    return float4(pow(c, 1.0 / 2.2), 1.0);\n"
+    "    if (hdr_mode != 0u) { return float4(pq(c * 0.02 * exposure), 1.0); }\n"
+    "    return float4(pow(max(c, 0.0), 1.0 / 2.2), 1.0);\n"
     "}\n";
