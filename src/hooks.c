@@ -1123,7 +1123,14 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (!dstv || !dstv->resource || !ensure_heaps()) {
         return;
     }
-    DXGI_FORMAT fmt = dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : DXGI_FORMAT_R10G10B10A2_UNORM;
+    /* Take the size/format from the resource's current desc: the view entry may predate
+       Azimuth's silent resize of the game chain to display size. */
+    D3D12_RESOURCE_DESC bd;
+    dstv->resource->lpVtbl->GetDesc(dstv->resource, &bd);
+    UINT bb_w = (UINT)bd.Width, bb_h = (UINT)bd.Height;
+    DXGI_FORMAT fmt = bd.Format != DXGI_FORMAT_UNKNOWN
+                          ? bd.Format
+                          : (dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : DXGI_FORMAT_R10G10B10A2_UNORM);
     if (!ensure_tonemap(fmt)) {
         return;
     }
@@ -1131,15 +1138,20 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     D3D12_RESOURCE_DESC cd;
     scene_color->lpVtbl->GetDesc(scene_color, &cd);
     UINT rw = (UINT)cd.Width, rh = (UINT)cd.Height;
-    float scale = (float)dstv->width / (float)rw;
-    if ((float)dstv->height / (float)rh < scale) {
-        scale = (float)dstv->height / (float)rh;
+    float scale = (float)bb_w / (float)rw;
+    if ((float)bb_h / (float)rh < scale) {
+        scale = (float)bb_h / (float)rh;
     }
     UINT out_w = (UINT)(rw * scale + 0.5f), out_h = (UINT)(rh * scale + 0.5f);
-    if (out_w > dstv->width) out_w = dstv->width;
-    if (out_h > dstv->height) out_h = dstv->height;
+    if (out_w > bb_w) out_w = bb_w;
+    if (out_h > bb_h) out_h = bb_h;
     ListState saved0 = *s;
     LONG color_state = scene_color_state, depth_state = scene_depth_state;
+    static int logged_tm;
+    if (!logged_tm++) {
+        log_msg("tonemap: bb %ux%u fmt %d, colour state 0x%lx, depth state 0x%lx, render %ux%u -> out %ux%u", bb_w, bb_h,
+                (int)fmt, color_state, depth_state, rw, rh, out_w, out_h);
+    }
     AcquireSRWLockShared(&mv_lock);
     if (fallback) {
         clear_mv(cl);
@@ -1160,12 +1172,20 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     up->lpVtbl->GetDesc(up, &ud);
     if (ensure_heaps()) {
         ID3D12Device_CreateShaderResourceView(g_device, up, NULL, cpu_handle(srv_heap, 0, g_srv_inc));
-        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
+        ID3D12Device_CreateShaderResourceView(g_device, scene_color, NULL, cpu_handle(srv_heap, 2, g_srv_inc));
+        D3D12_GPU_DESCRIPTOR_HANDLE g0;
+        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g0);
+        g_up_gpu = g0;
+        g_scene_gpu.ptr = g0.ptr + 2 * (SIZE_T)g_srv_inc;
     }
     transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
     UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u)));
     D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_up_gpu;
+    int scene_psr = (color_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) != 0;
+    if (hdr_mode == 4u && !scene_psr) {
+        transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     ListState saved = *s;
     ID3D12DescriptorHeap *heap = srv_heap;
@@ -1179,12 +1199,15 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 3, consts, 0);
     real_SetPipelineState(cl, tm_pso);
     real_OMSetRenderTargets(cl, 1, &s->rtv[0], TRUE, NULL);
-    D3D12_VIEWPORT vp = {0, 0, (float)dstv->width, (float)dstv->height, 0, 1};
-    D3D12_RECT sc = {0, 0, (LONG)dstv->width, (LONG)dstv->height};
+    D3D12_VIEWPORT vp = {0, 0, (float)bb_w, (float)bb_h, 0, 1};
+    D3D12_RECT sc = {0, 0, (LONG)bb_w, (LONG)bb_h};
     real_RSSetViewports(cl, 1, &vp);
     real_RSSetScissorRects(cl, 1, &sc);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     real_DrawInstanced(cl, 3, 1, 0, 0);
+    if (hdr_mode == 4u && !scene_psr) {
+        transition(cl, scene_color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES)color_state);
+    }
     transition(cl, up, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     *s = saved;
     restore_after_fsr(cl, s);
@@ -1192,8 +1215,8 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     static LONG tm_frames;
     LONG n = InterlockedIncrement(&tm_frames);
     if (n == 1 || n % 600 == 0) {
-        log_msg("FSR upscale+tonemap frame %ld (render %ux%u -> %ux%u, bb %ux%u fmt %d)", n, rw, rh, out_w, out_h,
-                dstv->width, dstv->height, (int)fmt);
+        log_msg("FSR upscale+tonemap frame %ld (render %ux%u -> %ux%u, bb %ux%u fmt %d)", n, rw, rh, out_w, out_h, bb_w,
+                bb_h, (int)fmt);
     }
 }
 
