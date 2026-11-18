@@ -797,6 +797,9 @@ static void ensure_readback(void) {
 
 /* Copy texel (0,0) of `src` into readback slot `slot` (256B row pitch). */
 static void diag_copy_texel(ID3D12GraphicsCommandList *cl, ID3D12Resource *src, UINT slot, DXGI_FORMAT fmt) {
+    D3D12_RESOURCE_DESC d;
+    src->lpVtbl->GetDesc(src, &d);
+    UINT cx = (UINT)d.Width / 2u, cy = (UINT)d.Height / 2u;
     D3D12_TEXTURE_COPY_LOCATION dstl, srcl;
     memset(&dstl, 0, sizeof(dstl));
     dstl.pResource = rb_buf;
@@ -811,7 +814,7 @@ static void diag_copy_texel(ID3D12GraphicsCommandList *cl, ID3D12Resource *src, 
     srcl.pResource = src;
     srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     srcl.SubresourceIndex = 0;
-    D3D12_BOX box = {0, 0, 0, 1, 1, 1};
+    D3D12_BOX box = {cx, cy, 0, cx + 1u, cy + 1u, 1};
     cl->lpVtbl->CopyTextureRegion(cl, &dstl, 0, 0, 0, &srcl, &box);
 }
 static int ensure_heaps(void) {
@@ -1264,8 +1267,8 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *up = fsr_output();
     D3D12_RESOURCE_DESC ud;
     up->lpVtbl->GetDesc(up, &ud);
-    /* Diagnostic: read back texel (0,0) of the FSR output, of the FSR input, and of the back
-       buffer (as the game left it) into a 4-slot ring; the slot from two frames ago is logged. */
+    /* Diagnostic: read back the CENTER texel of the FSR output, the FSR input, the scene
+       colour, and the back buffer (as the game left it) into a 4-slot ring. */
     {
         static LONG diag_n;
         LONG dn = InterlockedIncrement(&diag_n);
@@ -1283,8 +1286,11 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
                 transition(cl, src2, st2, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 diag_copy_texel(cl, src2, slot + 512u, fmt2);
                 transition(cl, src2, D3D12_RESOURCE_STATE_COPY_SOURCE, st2);
+                transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                diag_copy_texel(cl, scene_color, slot + 1024u, DXGI_FORMAT_R11G11B10_FLOAT);
+                transition(cl, scene_color, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)color_state);
                 transition(cl, bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                diag_copy_texel(cl, bb, slot + 1024u, fmt);
+                diag_copy_texel(cl, bb, slot + 1536u, fmt);
                 transition(cl, bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 if (dn > 2) {
                     UINT pslot = (UINT)((dn - 2) & 3u) * 2048u;
@@ -1293,9 +1299,10 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
                     if (SUCCEEDED(rb_buf->lpVtbl->Map(rb_buf, 0, &rr, &data)) && data) {
                         UINT32 upx = *(UINT32 *)((char *)data + pslot);
                         UINT32 inx = *(UINT32 *)((char *)data + pslot + 512u);
-                        UINT32 bbx = *(UINT32 *)((char *)data + pslot + 1024u);
+                        UINT32 scx = *(UINT32 *)((char *)data + pslot + 1024u);
+                        UINT32 bbx = *(UINT32 *)((char *)data + pslot + 1536u);
                         if (dn < 8 || dn % 120 == 0) {
-                            log_msg("diag frame %ld: up(0,0)=0x%08lx in(0,0)=0x%08lx bb(0,0)=0x%08lx", dn, upx, inx, bbx);
+                            log_msg("diag frame %ld: up=0x%08lx in=0x%08lx scene=0x%08lx bb=0x%08lx", dn, upx, inx, scx, bbx);
                         }
                         D3D12_RANGE wr = {0, 0};
                         rb_buf->lpVtbl->Unmap(rb_buf, 0, &wr);
