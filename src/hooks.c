@@ -137,9 +137,7 @@ static DXGI_SWAP_CHAIN_DESC1 chain_desc[2];
 static int chain_count;
 static UINT disp_w, disp_h;                 /* window chain size */
 static UINT scene_w, scene_h;               /* render size, from the scene colour */
-static ID3D12Resource *volatile g_upscale_tex;
 static D3D12_GPU_DESCRIPTOR_HANDLE g_scene_gpu;  /* srv_heap slot 2: scene colour SRV (control) */
-static D3D12_GPU_DESCRIPTOR_HANDLE g_up_gpu;
 static UINT rend_w, rend_h;                 /* game chain creation size */
 static int g_upscale;                       /* render < display */
 static ID3D12Resource *window_bb[8];       /* window chain back buffers (raw refs) */
@@ -959,7 +957,6 @@ static void clear_mv(ID3D12GraphicsCommandList *cl) {
     transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
-static void publish_upscale_tex(ID3D12Resource *up);
 
 /* Native AA: FSR on the HDR scene colour at render resolution, result copied back in place. */
 static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
@@ -992,25 +989,11 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (fallback) {
         clear_mv(cl);
     }
-    UINT out_w = w, out_h = h;
-    if (g_upscale && disp_w) {
-        float scale = (float)disp_w / (float)w;
-        if ((float)disp_h / (float)h < scale) {
-            scale = (float)disp_h / (float)h;
-        }
-        out_w = (UINT)(w * scale + 0.5f);
-        out_h = (UINT)(h * scale + 0.5f);
-        if (out_w > disp_w) out_w = disp_w;
-        if (out_h > disp_h) out_h = disp_h;
-    }
     int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                     out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
+                     w, h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
     ID3D12Resource *out = ok ? fsr_output() : NULL;
-    if (ok && out && g_upscale) {
-        publish_upscale_tex(out); /* HDR output; the game's present pass tonemaps it */
-    }
-    if (ok && out && !g_upscale) {
+    if (ok && out) {
         transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(cl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->lpVtbl->CopyResource(cl, scene_color, out);
@@ -1026,42 +1009,11 @@ static void run_fsr(ID3D12GraphicsCommandList *cl, ListState *s) {
     static LONG fsr_frames;
     LONG n = InterlockedIncrement(&fsr_frames);
     if (ok && (n == 1 || n % 600 == 0)) {
-        log_msg("FSR frame %ld (%s, render %ux%u -> out %ux%u)", n, g_upscale ? "upscale" : "native", w, h, out_w, out_h);
+        log_msg("FSR frame %ld (native, %ux%u)", n, w, h);
     }
 }
 
 
-/* Collect the scene's SRV handles and make our heap slot 0 the FSR output's SRV. */
-static void publish_upscale_tex(ID3D12Resource *up) {
-    /* Only publish our own copy: never touch the game's descriptors (that crashes
-       amdxc64 / corrupts the present pass). The tonemap pass samples slot 0 of
-       srv_heap directly. */
-    g_upscale_tex = up;
-    if (!up || !g_device) {
-        return;
-    }
-    if (ensure_heaps()) {
-        D3D12_CPU_DESCRIPTOR_HANDLE c = cpu_handle(srv_heap, 0, g_srv_inc);
-        ID3D12Device_CreateShaderResourceView(g_device, up, NULL, c);
-        srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(srv_heap, &g_up_gpu);
-        if (scene_color) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC sd;
-            memset(&sd, 0, sizeof(sd));
-            sd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            sd.Texture2D.MipLevels = 1;
-            ID3D12Device_CreateShaderResourceView(g_device, scene_color, &sd, cpu_handle(srv_heap, 2, g_srv_inc));
-            g_scene_gpu.ptr = g_up_gpu.ptr + 2 * g_srv_inc;
-        }
-    }
-    static LONG pub;
-    if (InterlockedIncrement(&pub) == 1) {
-        D3D12_RESOURCE_DESC ud;
-        up->lpVtbl->GetDesc(up, &ud);
-        log_msg("upscale output %p %ux%u fmt %d flags 0x%x", (void *)up, (UINT)ud.Width, (UINT)ud.Height,
-                (int)ud.Format, (unsigned)ud.Flags);
-    }
-}
 
 
 
@@ -1200,7 +1152,7 @@ static int ensure_stage(ID3D12GraphicsCommandList *cl, UINT w, UINT h) {
 }
 
 static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
-    if (!g_upscale || !fsr_enabled() || !g_upscale_tex || !s->num_rtv) {
+    if (!g_upscale || !fsr_enabled() || !scene_color || !scene_depth || !mv_tex || !s->num_rtv) {
         return;
     }
     if (cfg_debug_blink) {
@@ -1209,6 +1161,11 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
             return;
         }
     }
+    int st = mv_status();
+    if (st == 0) {
+        return;
+    }
+    int fallback = st < 0;
     const ViewEntry *dstv = view_find(s->rtv[0].ptr);
     if (!dstv || !dstv->resource || !ensure_heaps()) {
         return;
@@ -1217,10 +1174,39 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (!ensure_tonemap(fmt)) {
         return;
     }
-    ID3D12Resource *up = g_upscale_tex;
+    /* Dispatch FSR at the present draw (proven-stable point): HDR scene -> display-fitted HDR */
+    D3D12_RESOURCE_DESC cd;
+    scene_color->lpVtbl->GetDesc(scene_color, &cd);
+    UINT rw = (UINT)cd.Width, rh = (UINT)cd.Height;
+    float scale = (float)dstv->width / (float)rw;
+    if ((float)dstv->height / (float)rh < scale) {
+        scale = (float)dstv->height / (float)rh;
+    }
+    UINT out_w = (UINT)(rw * scale + 0.5f), out_h = (UINT)(rh * scale + 0.5f);
+    if (out_w > dstv->width) out_w = dstv->width;
+    if (out_h > dstv->height) out_h = dstv->height;
+    ListState saved0 = *s;
+    LONG color_state = scene_color_state, depth_state = scene_depth_state;
+    AcquireSRWLockShared(&mv_lock);
+    if (fallback) {
+        clear_mv(cl);
+    }
+    int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
+                     (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                     out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
+    ReleaseSRWLockShared(&mv_lock);
+    InterlockedExchange(&scene_color_state, color_state);
+    InterlockedExchange(&scene_depth_state, depth_state);
+    *s = saved0;
+    if (!ok) {
+        fsr_end_frame(0);
+        return;
+    }
+    ID3D12Resource *up = fsr_output();
     D3D12_RESOURCE_DESC ud;
     up->lpVtbl->GetDesc(up, &ud);
     if (!ensure_stage(cl, (UINT)ud.Width, (UINT)ud.Height)) {
+        fsr_end_frame(1);
         return;
     }
     /* Copy the FSR output into the staging texture here, on the present list (the same
@@ -1255,10 +1241,12 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_DrawInstanced(cl, 3, 1, 0, 0);
     *s = saved;
     restore_after_fsr(cl, s);
+    fsr_end_frame(1);
     static LONG tm_frames;
     LONG n = InterlockedIncrement(&tm_frames);
     if (n == 1 || n % 600 == 0) {
-        log_msg("tonemap pass frame %ld (%ux%u fmt %d, mode %u)", n, dstv->width, dstv->height, (int)fmt, hdr_mode);
+        log_msg("FSR upscale+tonemap frame %ld (render %ux%u -> %ux%u, bb %ux%u fmt %d)", n, rw, rh, out_w, out_h,
+                dstv->width, dstv->height, (int)fmt);
     }
 }
 
@@ -1293,8 +1281,8 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
         real_DrawInstanced(cl, vc, ic, sv, si);
         count_frame();
         setup_upscale_chains();
-        if (scene_ok) {
-            run_fsr(cl, s); /* both modes: native copies back, upscale publishes the HDR output */
+        if (scene_ok && !g_upscale) {
+            run_fsr(cl, s);
         }
         return;
     } else if (role == ROLE_MV && variant && s && s->num_vp) {
