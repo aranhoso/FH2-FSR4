@@ -1615,8 +1615,9 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
             }
             int area_r = (int)(rend_w * rend_h), area_d = (int)(disp_w * disp_h);
             g_upscale = cfg_mode == 1 ? 0 : (area_r < area_d);
-            /* Upscale mode feeds FSR the game's final LDR image, so run the context in LDR mode. */
-            fsr_config(g_upscale ? 0 : cfg_hdr, cfg_sharpness);
+            /* Upscale mode feeds FSR the game's display-referred LDR image: HDR flag on
+               (pass-through, no internal encode) but without auto-exposure gain. */
+            fsr_config(g_upscale ? 2 : cfg_hdr, cfg_sharpness);
             if (cfg_mode == 2 && area_r >= area_d) {
                 log_msg("upscale mode requested but render %ux%u >= display %ux%u; using native AA", rend_w, rend_h,
                         disp_w, disp_h);

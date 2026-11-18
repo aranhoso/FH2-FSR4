@@ -151,7 +151,10 @@ static int create_context(UINT w, UINT h, UINT out_w, UINT out_h, DXGI_FORMAT ou
     memset(&desc, 0, sizeof(desc));
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     desc.header.pNext = &version.header;
-    desc.flags = hdr_enabled ? (FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) : 0;
+    /* hdr==1: HDR + auto-exposure (native AA, verified). hdr==2: HDR pass-through only
+       (upscale of the game's display-referred LDR image - no exposure gain). */
+    desc.flags = (hdr_enabled ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0)
+                | (hdr_enabled == 1 ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0);
     desc.maxRenderSize.width = w;
     desc.maxRenderSize.height = h;
     desc.maxUpscaleSize.width = out_w;
