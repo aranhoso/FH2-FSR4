@@ -1171,9 +1171,11 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *up = g_upscale_tex;
     UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u)));
     D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_up_gpu;
-    D3D12_RESOURCE_STATES pre = hdr_mode == 4u ? (D3D12_RESOURCE_STATES)scene_color_state : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     ID3D12Resource *sampled = hdr_mode == 4u ? scene_color : up;
-    transition(cl, sampled, pre, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_RESOURCE_STATES pre = hdr_mode == 4u ? (D3D12_RESOURCE_STATES)scene_color_state : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (hdr_mode == 4u) {
+        transition(cl, sampled, pre, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); /* control mode only */
+    }
 
     ListState saved = *s;
     ID3D12DescriptorHeap *heap = srv_heap;
@@ -1195,7 +1197,9 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     real_RSSetScissorRects(cl, 1, &sc);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     real_DrawInstanced(cl, 3, 1, 0, 0);
-    transition(cl, sampled, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, pre);
+    if (hdr_mode == 4u) {
+        transition(cl, sampled, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, pre);
+    }
     *s = saved;
     restore_after_fsr(cl, s);
     static LONG tm_frames;

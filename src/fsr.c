@@ -32,6 +32,7 @@ static DXGI_FORMAT ctx_out_fmt;
 static int ctx_failed;
 
 static ID3D12Resource *out_tex;
+static int out_psr;   /* out_tex is in PIXEL_SHADER_RESOURCE (upscale mode, after dispatch) */
 
 static int hdr_enabled = 1;
 static float cfg_sharpness = -1.0f;   /* < 0: sharpening off */
@@ -274,6 +275,10 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
     if (motion_state != READ_STATE) {
         hooks_transition(cl, motion, motion_state, READ_STATE);
     }
+    if (out_psr) {
+        hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        out_psr = 0;
+    }
     struct ffxDispatchDescUpscale d;
     memset(&d, 0, sizeof(d));
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -326,6 +331,12 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
                     out_h, d.jitterOffset.x, d.jitterOffset.y);
         }
         need_reset = 0;
+        if (out_w != w || out_h != h) {
+            /* upscale: hand the output to the caller as PSR; we transition back to UAV
+               before the next dispatch */
+            hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            out_psr = 1;
+        }
         /* Next frame's jitter. Advancing here ties the sequence to rendered scenes. */
         jitter_index = (jitter_index + 1) % phase_count;
         struct ffxQueryDescUpscaleGetJitterOffset jo;
