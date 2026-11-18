@@ -738,6 +738,51 @@ static D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle(ID3D12DescriptorHeap *heap, UINT i
 }
 
 static ID3D12DescriptorHeap *srv_heap;   /* shader visible, slot 0: FSR output SRV */
+static ID3D12Resource *rb_buf;           /* readback buffer for 1x1 texel diagnostics (4 x 512B slots) */
+
+static void ensure_readback(void) {
+    if (rb_buf || !g_device) {
+        return;
+    }
+    D3D12_HEAP_PROPERTIES hp;
+    memset(&hp, 0, sizeof(hp));
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = 2048;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(ID3D12Device_CreateCommittedResource(g_device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+                                                    (void **)&rb_buf))) {
+        rb_buf = NULL;
+    }
+}
+
+/* Copy texel (0,0) of `src` into readback slot `slot` (256B row pitch). */
+static void diag_copy_texel(ID3D12GraphicsCommandList *cl, ID3D12Resource *src, UINT slot) {
+    D3D12_TEXTURE_COPY_LOCATION dstl, srcl;
+    memset(&dstl, 0, sizeof(dstl));
+    dstl.pResource = rb_buf;
+    dstl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dstl.PlacedFootprint.Offset = slot;
+    dstl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    dstl.PlacedFootprint.Footprint.Width = 1;
+    dstl.PlacedFootprint.Footprint.Height = 1;
+    dstl.PlacedFootprint.Footprint.Depth = 1;
+    dstl.PlacedFootprint.Footprint.RowPitch = 256;
+    memset(&srcl, 0, sizeof(srcl));
+    srcl.pResource = src;
+    srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcl.SubresourceIndex = 0;
+    D3D12_BOX box = {0, 0, 0, 1, 1, 1};
+    cl->lpVtbl->CopyTextureRegion(cl, &dstl, 0, 0, 0, &srcl, &box);
+}
 static int ensure_heaps(void) {
     if (rtv_heap && srv_heap) {
         return 1;
@@ -1178,9 +1223,42 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
         g_up_gpu = g0;
         g_scene_gpu.ptr = g0.ptr + 2 * (SIZE_T)g_srv_inc;
     }
+    /* Diagnostic: read back texel (0,0) of the FSR output and of the scene colour into a
+       4-slot ring; the slot from two frames ago is mapped and logged. */
+    {
+        static LONG diag_n;
+        LONG dn = InterlockedIncrement(&diag_n);
+        if (dn <= 600) {
+            ensure_readback();
+            if (rb_buf) {
+                UINT slot = (UINT)(dn & 3u) * 512u;
+                transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                diag_copy_texel(cl, up, slot);
+                transition(cl, up, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                transition(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                diag_copy_texel(cl, scene_color, slot + 256u);
+                transition(cl, scene_color, D3D12_RESOURCE_STATE_COPY_SOURCE, (D3D12_RESOURCE_STATES)color_state);
+                if (dn > 2) {
+                    UINT pslot = (UINT)((dn - 2) & 3u) * 512u;
+                    void *data = NULL;
+                    D3D12_RANGE rr = {pslot, pslot + 512u};
+                    if (SUCCEEDED(rb_buf->lpVtbl->Map(rb_buf, 0, &rr, &data)) && data) {
+                        UINT32 upx = *(UINT32 *)((char *)data + pslot);
+                        UINT32 scx = *(UINT32 *)((char *)data + pslot + 256u);
+                        if (dn < 8 || dn % 120 == 0) {
+                            log_msg("diag frame %ld: up(0,0)=0x%08lx scene(0,0)=0x%08lx", dn, upx, scx);
+                        }
+                        D3D12_RANGE wr = {0, 0};
+                        rb_buf->lpVtbl->Unmap(rb_buf, 0, &wr);
+                    }
+                }
+            }
+        }
+    }
     transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u)));
+    UINT hdr_mode = cfg_debug_raw == 2 ? 3u
+                    : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw == 4 ? 6u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u))));
     D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_up_gpu;
     int scene_psr = (color_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) != 0;
     if (hdr_mode == 4u && !scene_psr) {
