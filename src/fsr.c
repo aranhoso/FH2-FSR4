@@ -151,7 +151,7 @@ static int create_context(UINT w, UINT h, UINT out_w, UINT out_h, DXGI_FORMAT ou
     memset(&desc, 0, sizeof(desc));
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     desc.header.pNext = &version.header;
-    desc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | (hdr_enabled ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
+    desc.flags = hdr_enabled ? (FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) : 0;
     desc.maxRenderSize.width = w;
     desc.maxRenderSize.height = h;
     desc.maxUpscaleSize.width = out_w;

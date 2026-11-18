@@ -526,6 +526,34 @@ static BOOL is_window_bb(ID3D12Resource *r) {
     return FALSE;
 }
 
+/* The game's final LDR image at render resolution (the target the present pass stretches
+   into the back buffer). Upscaling THIS keeps the game's exact color/brightness/contrast. */
+static ID3D12Resource *ldr_tex;
+static LONG ldr_state;
+static DXGI_FORMAT ldr_fmt;
+
+static void note_ldr_target(ListState *s) {
+    if (!s->num_rtv || !scene_color || scene_w == 0) {
+        return;
+    }
+    const ViewEntry *c = view_find(s->rtv[0].ptr);
+    if (!c || !c->resource || c->resource == scene_color || is_window_bb(c->resource)) {
+        return;
+    }
+    if (c->format != DXGI_FORMAT_R10G10B10A2_UNORM && c->format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        return;
+    }
+    if (c->width != scene_w || c->height != scene_h) {
+        return;
+    }
+    if (ldr_tex != c->resource) {
+        ldr_tex = c->resource;
+        ldr_fmt = c->format;
+        ldr_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        log_msg("LDR target %p (%ux%u fmt %d)", (void *)ldr_tex, c->width, c->height, (int)ldr_fmt);
+    }
+}
+
 /* ---------------------------------------------------------------- list hooks */
 
 static void apply_viewports(ID3D12GraphicsCommandList *cl, ListState *s) {
@@ -693,6 +721,8 @@ static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl
                 InterlockedExchange(&scene_color_state, (LONG)b[i].Transition.StateAfter);
             } else if (b[i].Transition.pResource == depth) {
                 InterlockedExchange(&scene_depth_state, (LONG)b[i].Transition.StateAfter);
+            } else if (ldr_tex && b[i].Transition.pResource == ldr_tex) {
+                InterlockedExchange(&ldr_state, (LONG)b[i].Transition.StateAfter);
             }
         }
     }
@@ -1177,12 +1207,24 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     DXGI_FORMAT fmt = bd.Format != DXGI_FORMAT_UNKNOWN
                           ? bd.Format
                           : (dstv->format != DXGI_FORMAT_UNKNOWN ? dstv->format : DXGI_FORMAT_R10G10B10A2_UNORM);
-    if (!ensure_tonemap(fmt)) {
+    /* Once per scene frame: there can be several back-buffer draws (stretch, HUD, ...). */
+    {
+        static LONG last_tm_frame = -1;
+        LONG f = (LONG)present_count;
+        if (last_tm_frame == f) {
+            return;
+        }
+        last_tm_frame = f;
+    }
+    /* Prefer the game's final LDR image as the FSR input: upscaling it keeps the game's exact
+       color/brightness/contrast, and the result copies straight over the back buffer. */
+    int use_ldr = ldr_tex != NULL;
+    if (!use_ldr && !ensure_tonemap(fmt)) {
         return;
     }
-    /* Dispatch FSR at the present draw (proven-stable point): HDR scene -> display-fitted HDR */
+    /* Dispatch FSR at the present draw (proven-stable point). */
     D3D12_RESOURCE_DESC cd;
-    scene_color->lpVtbl->GetDesc(scene_color, &cd);
+    (use_ldr ? ldr_tex : scene_color)->lpVtbl->GetDesc(use_ldr ? ldr_tex : scene_color, &cd);
     UINT rw = (UINT)cd.Width, rh = (UINT)cd.Height;
     float scale = (float)bb_w / (float)rw;
     if ((float)bb_h / (float)rh < scale) {
@@ -1193,20 +1235,26 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     if (out_h > bb_h) out_h = bb_h;
     ListState saved0 = *s;
     LONG color_state = scene_color_state, depth_state = scene_depth_state;
+    LONG in_state = use_ldr ? ldr_state : color_state;
     static int logged_tm;
     if (!logged_tm++) {
-        log_msg("tonemap: bb %ux%u fmt %d, colour state 0x%lx, depth state 0x%lx, render %ux%u -> out %ux%u", bb_w, bb_h,
-                (int)fmt, color_state, depth_state, rw, rh, out_w, out_h);
+        log_msg("tonemap: bb %ux%u fmt %d, input %s state 0x%lx, depth state 0x%lx, render %ux%u -> out %ux%u", bb_w, bb_h,
+                (int)fmt, use_ldr ? "LDR" : "HDR", in_state, depth_state, rw, rh, out_w, out_h);
     }
     AcquireSRWLockShared(&mv_lock);
     if (fallback) {
         clear_mv(cl);
     }
-    int ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
+    int ok = fsr_run(cl, use_ldr ? ldr_tex : scene_color, (D3D12_RESOURCE_STATES)in_state, scene_depth,
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                     out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
+                     out_w, out_h, use_ldr ? fmt : DXGI_FORMAT_R11G11B10_FLOAT,
+                     use_ldr ? ldr_fmt : DXGI_FORMAT_R11G11B10_FLOAT);
     ReleaseSRWLockShared(&mv_lock);
-    InterlockedExchange(&scene_color_state, color_state);
+    if (use_ldr) {
+        InterlockedExchange(&ldr_state, in_state);
+    } else {
+        InterlockedExchange(&scene_color_state, color_state);
+    }
     InterlockedExchange(&scene_depth_state, depth_state);
     *s = saved0;
     if (!ok) {
@@ -1216,6 +1264,33 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *up = fsr_output();
     D3D12_RESOURCE_DESC ud;
     up->lpVtbl->GetDesc(up, &ud);
+    if (use_ldr) {
+        /* Copy the upscaled LDR image over the back buffer (same format), centered. */
+        ID3D12Resource *bb = dstv->resource;
+        UINT dx = (bb_w - out_w) / 2, dy = (bb_h - out_h) / 2;
+        transition(cl, bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(cl, up, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dl, sl;
+        memset(&dl, 0, sizeof(dl));
+        dl.pResource = bb;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        memset(&sl, 0, sizeof(sl));
+        sl.pResource = up;
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_BOX box = {0, 0, 0, out_w, out_h, 1};
+        cl->lpVtbl->CopyTextureRegion(cl, &dl, dx, dy, 0, &sl, &box);
+        transition(cl, up, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(cl, bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        restore_after_fsr(cl, s);
+        fsr_end_frame(1);
+        static LONG ldr_frames;
+        LONG n = InterlockedIncrement(&ldr_frames);
+        if (n == 1 || n % 600 == 0) {
+            log_msg("FSR LDR upscale frame %ld (render %ux%u fmt %d -> %ux%u at +%u+%u, bb %ux%u fmt %d)", n, rw, rh,
+                    (int)ldr_fmt, out_w, out_h, dx, dy, bb_w, bb_h, (int)fmt);
+        }
+        return;
+    }
     if (ensure_heaps()) {
         ID3D12Device_CreateShaderResourceView(g_device, up, NULL, cpu_handle(srv_heap, 0, g_srv_inc));
         ID3D12Device_CreateShaderResourceView(g_device, scene_color, NULL, cpu_handle(srv_heap, 2, g_srv_inc));
@@ -1326,6 +1401,9 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
+    if (s && role != ROLE_RESOLVE) {
+        note_ldr_target(s);
+    }
     if (role == ROLE_RESOLVE && s) {
         BOOL scene_ok = note_scene_resources(s);
         real_DrawInstanced(cl, vc, ic, sv, si);
@@ -1351,6 +1429,9 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
+    if (s && role != ROLE_RESOLVE) {
+        note_ldr_target(s);
+    }
     if (role == ROLE_RESOLVE && s) {
         /* FH2's resolve is a plain (non-indexed) draw on Azimuth 1.x; just track its targets. */
         note_scene_resources(s);
@@ -1517,9 +1598,10 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
             if (cfg_hdr < 0) {
                 cfg_hdr = 1; /* the scene buffer is always linear HDR (R11G11B10_FLOAT) */
             }
-            fsr_config(cfg_hdr, cfg_sharpness);
             int area_r = (int)(rend_w * rend_h), area_d = (int)(disp_w * disp_h);
             g_upscale = cfg_mode == 1 ? 0 : (area_r < area_d);
+            /* Upscale mode feeds FSR the game's final LDR image, so run the context in LDR mode. */
+            fsr_config(g_upscale ? 0 : cfg_hdr, cfg_sharpness);
             if (cfg_mode == 2 && area_r >= area_d) {
                 log_msg("upscale mode requested but render %ux%u >= display %ux%u; using native AA", rend_w, rend_h,
                         disp_w, disp_h);
