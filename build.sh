@@ -49,6 +49,8 @@ if [ "$1" = "release" ]; then
     rm -rf "$OUT" "$OUT.zip"
     mkdir -p "$OUT"
     cp build/dxgi.dll "$PKG/amd_fidelityfx_loader_dx12.dll" "$PKG/amd_fidelityfx_upscaler_dx12.dll" "$OUT/"
+    # Ship the PDB alongside the DLL so crash dumps resolve mod symbols (proxy.lib is link-time only).
+    [ -f build/dxgi.pdb ] && cp build/dxgi.pdb "$OUT/"
     cp "$FFX/Kits/FidelityFX/docs/license.md" "$OUT/LICENSE-AMD-FSR.txt"
     cp LICENSE "$OUT/LICENSE.txt"
     cp release/README.txt "$OUT/"
