@@ -1171,7 +1171,7 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     ID3D12Resource *up = g_upscale_tex;
     UINT hdr_mode = cfg_debug_raw == 2 ? 3u : (cfg_debug_raw == 3 ? 4u : (cfg_debug_raw ? 2u : (cfg_hdr ? 1u : 0u)));
     D3D12_GPU_DESCRIPTOR_HANDLE tbl = hdr_mode == 4u ? g_scene_gpu : g_up_gpu;
-    ID3D12Resource *sampled = hdr_mode == 4u ? scene_color : up;
+    ID3D12Resource *sampled = hdr_mode == 4u ? scene_color : up; /* up == fsr_output() == staging, already PSR */
     D3D12_RESOURCE_STATES pre = hdr_mode == 4u ? (D3D12_RESOURCE_STATES)scene_color_state : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     if (hdr_mode == 4u) {
         transition(cl, sampled, pre, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); /* control mode only */

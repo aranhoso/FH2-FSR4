@@ -32,7 +32,8 @@ static DXGI_FORMAT ctx_out_fmt;
 static int ctx_failed;
 
 static ID3D12Resource *out_tex;
-static int out_psr;   /* out_tex is in PIXEL_SHADER_RESOURCE (upscale mode, after dispatch) */
+static ID3D12Resource *stage_tex;  /* copy of out_tex in PSR, for the caller to sample */
+static UINT stage_w, stage_h;
 
 static int hdr_enabled = 1;
 static float cfg_sharpness = -1.0f;   /* < 0: sharpening off */
@@ -206,6 +207,21 @@ static int create_context(UINT w, UINT h, UINT out_w, UINT out_h, DXGI_FORMAT ou
         return 0;
     }
     ID3D12Resource_SetName(out_tex, L"FH2FSR Output");
+    if (stage_tex) {
+        stage_tex = NULL; /* leaked on purpose if referenced in flight */
+        stage_w = stage_h = 0;
+    }
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE; /* staging needs no UAV */
+    if (FAILED(ID3D12Device_CreateCommittedResource(device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+                                                    &IID_ID3D12Resource, (void **)&stage_tex))) {
+        log_msg("FSR: staging texture creation failed");
+        stage_tex = NULL;
+    } else {
+        ID3D12Resource_SetName(stage_tex, L"FH2FSR Stage");
+        stage_w = out_w;
+        stage_h = out_h;
+    }
     ctx_w = w;
     ctx_h = h;
     ctx_out_w = out_w;
@@ -275,10 +291,6 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
     if (motion_state != READ_STATE) {
         hooks_transition(cl, motion, motion_state, READ_STATE);
     }
-    if (out_psr) {
-        hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        out_psr = 0;
-    }
     struct ffxDispatchDescUpscale d;
     memset(&d, 0, sizeof(d));
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -331,11 +343,13 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
                     out_h, d.jitterOffset.x, d.jitterOffset.y);
         }
         need_reset = 0;
-        if (out_w != w || out_h != h) {
-            /* upscale: hand the output to the caller as PSR; we transition back to UAV
-               before the next dispatch */
-            hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            out_psr = 1;
+        if ((out_w != w || out_h != h) && stage_tex) {
+            /* upscale: hand the output to the caller via the staging texture (PSR) */
+            hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            hooks_transition(cl, stage_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->lpVtbl->CopyResource(cl, stage_tex, out_tex);
+            hooks_transition(cl, stage_tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            hooks_transition(cl, out_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         /* Next frame's jitter. Advancing here ties the sequence to rendered scenes. */
         jitter_index = (jitter_index + 1) % phase_count;
@@ -355,7 +369,7 @@ int fsr_run(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, D3D12_RESOURCE
 }
 
 ID3D12Resource *fsr_output(void) {
-    return out_tex;
+    return stage_tex ? stage_tex : out_tex;
 }
 
 void fsr_end_frame(int ran) {
