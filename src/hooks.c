@@ -1266,9 +1266,9 @@ static void draw_pass(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pso, D
     ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(cl, 0, tbl);
     float consts[4];
     memcpy(&consts[0], &mode, 4);
-    consts[1] = 1.0f / (float)tex_w;
-    consts[2] = 1.0f / (float)tex_h;
-    consts[3] = exposure;
+    consts[1] = exposure;
+    consts[2] = 1.0f / (float)tex_w;
+    consts[3] = 1.0f / (float)tex_h;
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cl, 1, 4, consts, 0);
     real_SetPipelineState(cl, pso);
     real_OMSetRenderTargets(cl, 1, &rtv, TRUE, NULL);
