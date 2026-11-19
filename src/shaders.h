@@ -57,6 +57,6 @@ static const char PASS_HLSL[] =
     "    if (mode == 4u) { return c; }\n"
     "    if (mode == 6u) { return float4(c.rgb * 0.001, 1.0); }\n"
     "    if (mode == 2u) { return float4(pq_dec(c.rgb), 1.0); }\n"
-    "    return float4(pow(max(c.rgb * 0.05 * exposure, 0.0), 1.0 / 2.2), 1.0);\n"
+    "    return float4(pow(max(c.rgb * 0.165 * exposure, 0.0), 1.0 / 2.2), 1.0);\n"
     "}\n"
 ;
