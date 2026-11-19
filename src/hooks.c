@@ -528,6 +528,10 @@ static BOOL is_window_bb(ID3D12Resource *r) {
    pass stretches into the back buffer. The game ping-pongs between two of them, so keep the
    two most recent. Upscaling THIS (in linear space) keeps the game's exact look. */
 static ID3D12Resource *ldr_tex[2];
+/* A second HDR (R11G11B10) render-res target written after the resolve: the game's
+   post-graded scene, which is what the tonemap actually consumes. Prefer it as FSR input. */
+static ID3D12Resource *grade_tex;
+static volatile LONG grade_state;
 static LONG ldr_state[2] = {D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET};
 static DXGI_FORMAT ldr_fmt[2];
 static int ldr_count;
@@ -574,6 +578,27 @@ static void note_ldr_target(ListState *s) {
     ldr_state[0] = D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (is_new) {
         log_msg("LDR target %p (%ux%u fmt %d) #%d", (void *)ldr_tex[0], c->width, c->height, (int)ldr_fmt[0], ldr_count);
+    }
+}
+
+static void note_grade_target(ListState *s) {
+    if (!s->num_rtv || !scene_color || scene_w == 0) {
+        return;
+    }
+    const ViewEntry *c = view_find(s->rtv[0].ptr);
+    if (!c || !c->resource || c->resource == scene_color || is_window_bb(c->resource)) {
+        return;
+    }
+    if (c->format != DXGI_FORMAT_R11G11B10_FLOAT) {
+        return;
+    }
+    if (c->width != scene_w || c->height != scene_h) {
+        return;
+    }
+    if (grade_tex != c->resource) {
+        grade_tex = c->resource;
+        grade_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        log_msg("post-grade HDR target %p (%ux%u)", (void *)grade_tex, c->width, c->height);
     }
 }
 
@@ -744,6 +769,8 @@ static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl
                 InterlockedExchange(&scene_color_state, (LONG)b[i].Transition.StateAfter);
             } else if (b[i].Transition.pResource == depth) {
                 InterlockedExchange(&scene_depth_state, (LONG)b[i].Transition.StateAfter);
+            } else if (grade_tex && b[i].Transition.pResource == grade_tex) {
+                InterlockedExchange(&grade_state, (LONG)b[i].Transition.StateAfter);
             } else if (ldr_count > 0 && b[i].Transition.pResource == ldr_tex[0]) {
                 InterlockedExchange(&ldr_state[0], (LONG)b[i].Transition.StateAfter);
             } else if (ldr_count > 1 && b[i].Transition.pResource == ldr_tex[1]) {
@@ -1318,11 +1345,12 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
     }
     /* Prefer the game's final display-referred image as the source (upscaled in linear space,
        so its exact look is preserved). Fall back to the HDR scene colour. */
-    int use_ldr = 0; /* HDR scene input: stable state tracking, no double-TAA ghosting */
-    ID3D12Resource *in_tex = use_ldr ? ldr_tex[0] : scene_color;
-    D3D12_RESOURCE_STATES in_state = use_ldr ? (D3D12_RESOURCE_STATES)ldr_state[0]
-                                              : (D3D12_RESOURCE_STATES)scene_color_state;
-    DXGI_FORMAT in_fmt = use_ldr ? ldr_fmt[0] : DXGI_FORMAT_R11G11B10_FLOAT;
+    int use_ldr = 0; /* LDR 2-pass disabled: the FSR backend rejects our intermediate texture */
+    int use_grade = grade_tex != NULL;
+    ID3D12Resource *in_tex = use_grade ? grade_tex : scene_color;
+    D3D12_RESOURCE_STATES in_state = use_grade ? (D3D12_RESOURCE_STATES)grade_state
+                                               : (D3D12_RESOURCE_STATES)scene_color_state;
+    DXGI_FORMAT in_fmt = DXGI_FORMAT_R11G11B10_FLOAT;
     if (!ensure_pass(fmt, 0)) {
         return;
     }
@@ -1375,13 +1403,15 @@ static void run_tonemap(ID3D12GraphicsCommandList *cl, ListState *s) {
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                      out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
     } else {
-        ok = fsr_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
+        ok = fsr_run(cl, in_tex, in_state, scene_depth,
                      (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                      out_w, out_h, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT);
     }
     ReleaseSRWLockShared(&mv_lock);
     if (use_ldr) {
         InterlockedExchange(&ldr_state[0], in_state_saved);
+    } else if (use_grade) {
+        InterlockedExchange(&grade_state, in_state_saved);
     } else {
         InterlockedExchange(&scene_color_state, color_state);
     }
@@ -1478,6 +1508,7 @@ static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, 
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (s && role != ROLE_RESOLVE) {
         note_ldr_target(s);
+        note_grade_target(s);
     }
     if (role == ROLE_RESOLVE && s) {
         BOOL scene_ok = note_scene_resources(s);
@@ -1506,6 +1537,7 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
     if (s && role != ROLE_RESOLVE) {
         note_ldr_target(s);
+        note_grade_target(s);
     }
     if (role == ROLE_RESOLVE && s) {
         /* FH2's resolve is a plain (non-indexed) draw on Azimuth 1.x; just track its targets. */
