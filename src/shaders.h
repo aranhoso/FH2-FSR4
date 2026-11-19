@@ -31,14 +31,19 @@ static const char MV_PS_HLSL[] =
 
 /* Fullscreen tonemap pass used in upscale mode: point-samples the FSR output (HDR) and writes
    the tonemapped image into the back buffer. cbuffer: hdr_mode, texel.xy. */
-static const char TONEMAP_HLSL[] =
-    "Texture2D<float3> hdr : register(t0);\n"
-    "cbuffer C : register(b0) { uint hdr_mode; float2 texel; float exposure; };\n"
-    "float3 pq(float3 c) {\n"
-    "    const float m1 = 0.159301758125, m2 = 78.84375;\n"
-    "    const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
-    "    float3 y = pow(max(c, 0.0), float3(m1, m1, m1));\n"
-    "    return pow((c1 + c2 * y) / (1.0 + c3 * y), float3(m2, m2, m2));\n"
+static const char PASS_HLSL[] =
+    "Texture2D<float4> hdr : register(t0);\n"
+    "cbuffer C : register(b0) { uint mode; float2 texel; float exposure; };\n"
+    "static const float M1 = 0.159301758125, M2 = 78.84375;\n"
+    "static const float C1 = 0.8359375, C2 = 18.8515625, C3 = 18.6875;\n"
+    "float3 pq_enc(float3 y) {\n"
+    "    float3 t = pow(max(y, 0.0), float3(M1, M1, M1));\n"
+    "    return pow((C1 + C2 * t) / (1.0 + C3 * t), float3(M2, M2, M2));\n"
+    "}\n"
+    "float3 pq_dec(float3 n) {\n"
+    "    float3 x = pow(saturate(n), float3(1.0 / M2, 1.0 / M2, 1.0 / M2));\n"
+    "    float3 num = max(x - C1, 0.0);\n"
+    "    return pow(num / (C2 - C3 * x), float3(1.0 / M1, 1.0 / M1, 1.0 / M1));\n"
     "}\n"
     "void vs(uint id : SV_VertexID, out float4 pos : SV_POSITION, out float2 uv : TEXCOORD0) {\n"
     "    float2 t = float2((id << 1) & 2, id & 2);\n"
@@ -47,10 +52,11 @@ static const char TONEMAP_HLSL[] =
     "}\n"
     "float4 ps(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
     "    int2 p = int2(pos.xy);\n"
-    "    float3 c = hdr.Load(int3(p, 0));\n"
-    "    if (hdr_mode == 6u) { return float4(c * 0.001, 1.0); }\n"
-    "    if (hdr_mode == 2u) { return float4(c, 1.0); }\n"
-    "    if (hdr_mode == 3u) { return float4(1, 0, 1, 1); }\n"
-    "    if (hdr_mode != 0u) { return float4(pq(c * 0.02 * exposure), 1.0); }\n"
-    "    return float4(pow(max(c, 0.0), 1.0 / 2.2), 1.0);\n"
-    "}\n";
+    "    float4 c = hdr.Load(int3(p, 0));\n"
+    "    if (mode == 3u) { return float4(1, 0, 1, 1); }\n"
+    "    if (mode == 4u) { return c; }\n"
+    "    if (mode == 6u) { return float4(c.rgb * 0.001, 1.0); }\n"
+    "    if (mode == 2u) { return float4(pq_dec(c.rgb), 1.0); }\n"
+    "    return float4(pq_enc(c.rgb * exposure), 1.0);\n"
+    "}\n"
+;
