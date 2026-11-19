@@ -5,9 +5,18 @@
 # The AMD FSR API headers and DLLs come from the official FSR SDK v2.3.0 (FSR Upscaling 4.1.1).
 set -e
 cd "$(dirname "$0")"
-VERSION=0.1.0
+VERSION=0.3.0
 SDK_TAG=v2.3.0
 ZIG=${ZIG:-zig}
+
+# Build dependencies: Zig 0.15.2 (compiler), git + network (one-time sparse clone of the
+# FSR SDK headers into third_party/), and for `release` mode curl + unzip (signed AMD DLLs;
+# zip is optional, tar.exe is used as fallback).
+if ! command -v "$ZIG" >/dev/null 2>&1; then
+    echo "zig not found at '$ZIG'. Install Zig 0.15.2 (https://ziglang.org/download/) and rerun:" >&2
+    echo "  ZIG=/path/to/zig ./build.sh" >&2
+    exit 1
+fi
 
 # FSR API headers: sparse checkout of the official SDK repository.
 FFX=third_party/FidelityFX-SDK
@@ -40,6 +49,8 @@ if [ "$1" = "release" ]; then
     rm -rf "$OUT" "$OUT.zip"
     mkdir -p "$OUT"
     cp build/dxgi.dll "$PKG/amd_fidelityfx_loader_dx12.dll" "$PKG/amd_fidelityfx_upscaler_dx12.dll" "$OUT/"
+    # Ship the PDB alongside the DLL so crash dumps resolve mod symbols (proxy.lib is link-time only).
+    [ -f build/dxgi.pdb ] && cp build/dxgi.pdb "$OUT/"
     cp "$FFX/Kits/FidelityFX/docs/license.md" "$OUT/LICENSE-AMD-FSR.txt"
     cp LICENSE "$OUT/LICENSE.txt"
     cp release/README.txt "$OUT/"

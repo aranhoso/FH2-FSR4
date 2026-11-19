@@ -1,8 +1,8 @@
 # FH2-FSR4
 
-**AMD FSR 4 Native AA (FSR Upscaling 4.1.1) for Forza Horizon 2 running on [Azimuth](https://almost-there-games.itch.io/azimuth).**
+**AMD FSR 4 (FSR Upscaling 4.1.1) for Forza Horizon 2 running on [Azimuth](https://almost-there-games.itch.io/azimuth).**
 
-This mod replaces the game's MSAA with FSR 4's temporal anti-aliasing at native resolution (no upscaling). The result is no jaggies, stable fences, wires and foliage, and a much cleaner image in motion.
+This mod replaces the game's MSAA with FSR 4's temporal anti-aliasing. At native resolution it is Native AA (no upscaling); when Azimuth renders below the display resolution (`resolution=` in `data\azimuth.ini`), the mod replaces Azimuth's final bilinear stretch with FSR upscaling to the display resolution. The result is no jaggies, stable fences, wires and foliage, and a much cleaner image in motion.
 
 It is an unofficial mod, not affiliated with AMD, Microsoft, Playground Games or Almost There Games.
 
@@ -10,7 +10,7 @@ It is an unofficial mod, not affiliated with AMD, Microsoft, Playground Games or
 
 | | |
 |---|---|
-| Azimuth | 0.9.9 |
+| Azimuth | 1.0.x (render-pass hashes taken from Azimuth 1.0.3 / 1.0.4) |
 | Forza Horizon 2 | build 1.0.0.64 (your own copy, set up in Azimuth) |
 | GPU | AMD Radeon RX 9000 (RDNA 4). RX 7000 (RDNA 3) should also work, since AMD enabled FSR 4.1 for it in SDK 2.3.0 |
 | Driver | A recent AMD Software: Adrenalin |
@@ -36,8 +36,29 @@ It works alongside [FH2 Extra Options](https://github.com/RokkuDayo/ForzaHorizon
 | Key | Action |
 |---|---|
 | **F11** | Toggle FSR on/off (handy for comparisons) |
-| F9 | Motion-vector debug overlay: off, blended or opaque |
-| F10 | Overlay brightness scale |
+
+The key is polled from a dedicated thread, so F11 works even when the game is launched from Steam.
+
+## FSR upscaling
+
+Azimuth 1.x renders the game at the render resolution (`resolution=` / `aspect=` in `data\azimuth.ini`) into the HDR scene buffer and stretches/tonemaps it onto the display-sized back buffer itself. When the render size is smaller than the display size, this mod upscales the HDR scene with FSR 4 right after the scene resolve and redirects the game's scene-colour texture bindings to the upscaled image, so the game's own present pass tonemaps the upscaled frame into the back buffer (pillarboxing and the HUD are handled by the game at display resolution and stay crisp).
+
+1. Set e.g. `resolution=1080` with `aspect=21:9` (match your display's aspect) in `data\azimuth.ini` on a 3440x1440 display (keep `antialiasing=off`).
+2. Launch as usual. `fh2_fsr.log` reports `upscale mode: render 2580x1080 < display 3440x1440` and `FSR frame N (upscale, render 2580x1080 -> out 3440x1440)`.
+
+When render size == display size, the mod automatically stays in Native AA mode. Works the same with HDR on or off — the scene buffer is linear HDR either way; only the game's final tonemap differs.
+
+Optional `fh2_fsr.ini` next to the DLLs:
+
+```ini
+[fsr]
+mode=auto        ; auto | native | upscale
+hdr=auto         ; auto | on | off  (FSR HDR flag on the scene input; auto = on)
+sharpness=-1     ; -1 = off, 0..1 = FSR sharpening strength (1 = max)
+debug_blink=0    ; 1 = alternate 30 frames FSR / 30 frames the game's own stretch (visibility test)
+```
+
+Motion vectors, depth and camera jitter are taken from the game's own passes at render resolution, so they scale automatically with the render size.
 
 The log is written to `fh2_fsr.log` in the Azimuth folder.
 
@@ -48,9 +69,13 @@ FH2 never had TAA, and FSR needs four things the game doesn't provide out of the
 - **Sub-pixel jitter:** offsets the viewport of the scene passes, only while the scene depth buffer is bound, following FSR's official jitter sequence.
 - **Full-resolution motion vectors:** FH2's motion blur already computes the reprojection of the camera and of each car (the matrix is picked by each object's stencil value), but at half resolution and with a clamped vector. The mod runs a variant of that shader at full resolution, without the clamp, using the game's own bindings.
 - **HDR colour and depth:** the mod takes the targets of the scene resolve, before tonemapping and the HUD.
-- **FSR dispatch:** FSR runs inside the game's own command list, right before the tonemap. Its output is copied back into the scene colour, and the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
+- **FSR dispatch:** FSR runs inside the game's own command list right after the scene resolve. In Native AA mode its output is copied back into the scene colour in place; in upscale mode (render < display) the output is the scene upscaled to the display-fitted size and the game's scene-colour SRV descriptors are redirected to it. Either way the mod then restores the game's descriptor heaps, root signatures, tables and PSO.
 
-The game's passes are identified by the DXBC checksums of their pixel shaders, and the resolve also by its render-target formats.
+The game's passes are identified by the DXBC checksums of their pixel shaders (the Azimuth 1.x builds), and the resolve is also validated by its render-target formats (R11G11B10 colour + D32 depth).
+
+## Azimuth 1.x notes
+
+On Azimuth 1.x the mod deliberately does **not** hook `Present`/`ResizeBuffers` on the swap chain: the Steam overlay hooks `Present` too, and with both on the vtable the game crashed at startup when launched from Steam. Azimuth 1.x may also own several swap chains, so Present is not a reliable frame boundary. Frame counting and the jitter state are driven from the scene resolve instead. When the game stops its velocity pass (pause/photo mode), the mod falls back to zero motion vectors with a history reset.
 
 ## Known limitations
 
